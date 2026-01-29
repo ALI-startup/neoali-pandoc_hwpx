@@ -87,12 +87,16 @@ class PandocToHwpx:
             'hc': 'http://www.hancom.co.kr/hwpml/2011/core',
             'hs': 'http://www.hancom.co.kr/hwpml/2011/section'
         }
-        # cache key: (base_char_pr_id, frozenset(active_formats), color) -> new_char_pr_id
+        # cache key: (base_char_pr_id, frozenset(active_formats), color, font_size) -> new_char_pr_id
         self.char_pr_cache = {} 
         self.max_char_pr_id = 0
         self.max_para_pr_id = 0
+        self.max_border_fill_id = 0
         
         self.images = [] # metadata for images
+        
+        # Table-related attributes (from original)
+        self.table_border_fill_id = None
 
         # Metadata extraction
         self.title = None
@@ -181,139 +185,188 @@ class PandocToHwpx:
         
         # If it's already hex
         if color.startswith('#'):
-            # Ensure proper format
-            if len(color) == 4:  # #RGB -> #RRGGBB
-                return f'#{color[1]}{color[1]}{color[2]}{color[2]}{color[3]}{color[3]}'.upper()
-            return color.upper()
+            if len(color) == 7:  # #RRGGBB
+                return color.upper()
+            elif len(color) == 4:  # #RGB -> #RRGGBB
+                r, g, b = color[1], color[2], color[3]
+                return f'#{r}{r}{g}{g}{b}{b}'.upper()
         
-        # If it's rgb(r, g, b) or rgba(r, g, b, a)
+        # If it's rgb(r, g, b)
         if color.startswith('rgb'):
-            match = re.search(r'rgba?\((\d+),\s*(\d+),\s*(\d+)', color)
+            import re
+            match = re.search(r'rgb\s*\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)', color)
             if match:
-                r, g, b = match.groups()
-                return f'#{int(r):02X}{int(g):02X}{int(b):02X}'
+                r, g, b = int(match.group(1)), int(match.group(2)), int(match.group(3))
+                return f'#{r:02X}{g:02X}{b:02X}'
         
-        # Default fallback
         return '#000000'
 
-    def _pt_to_hwp_units(self, pt_str):
-        """Convert point size to HWP units (1pt = 100 units)"""
+    def _convert_size_to_hwp(self, size_str):
+        """Convert CSS font-size to HWP point size"""
+        if not size_str:
+            return None
+            
+        size_str = size_str.lower().strip()
+        
+        # If it's already in pt
+        if size_str.endswith('pt'):
+            try:
+                return int(float(size_str[:-2]))
+            except:
+                return None
+        
+        # If it's in px (assuming 96 DPI)
+        if size_str.endswith('px'):
+            try:
+                px = float(size_str[:-2])
+                pt = px * 72 / 96  # Convert px to pt
+                return int(pt)
+            except:
+                return None
+        
+        # If it's a number without unit, assume pt
         try:
-            # Handle both "11pt" and "11"
-            pt_str = str(pt_str).lower().replace('pt', '').strip()
-            pt = float(pt_str)
-            return int(pt * 100)
+            return int(float(size_str))
         except:
-            return 1000  # Default 10pt
+            return None
 
     def _extract_style_from_attr(self, attr):
-        """Extract style properties from Pandoc attr [id, [classes], [[key, val]]]"""
-        if not attr or len(attr) < 3:
-            return {}
-        
+        """Extract style information from Pandoc attributes"""
+        # attr = [id, [classes], [[key, val], ...]]
         styles = {}
-        attr_dict = dict(attr[2])  # Convert list of [key, val] to dict
         
-        # Parse style attribute if present
-        if 'style' in attr_dict:
-            style_str = attr_dict['style']
-            # Parse CSS-like styles: "color: #FF0000; background-color: #00FF00"
-            for style_part in style_str.split(';'):
-                if ':' in style_part:
-                    key, value = style_part.split(':', 1)
-                    key = key.strip().lower()
-                    value = value.strip()
-                    
-                    if key == 'color':
-                        styles['color'] = value
-                    elif key == 'background-color' or key == 'background':
-                        styles['background'] = value
-                    elif key == 'font-weight':
-                        if 'bold' in value.lower() or value == '700' or value == '800' or value == '900':
-                            styles['bold'] = True
-                    elif key == 'font-style':
-                        if 'italic' in value.lower():
-                            styles['italic'] = True
-                    elif key == 'text-decoration':
-                        if 'underline' in value.lower():
-                            styles['underline'] = True
-                        if 'line-through' in value.lower():
-                            styles['strikeout'] = True
-                    elif key == 'font-size':
-                        styles['font-size'] = value
+        if len(attr) < 3:
+            return styles
+        
+        # Check classes for common formatting
+        classes = attr[1]
+        for cls in classes:
+            cls_lower = cls.lower()
+            if 'bold' in cls_lower or 'strong' in cls_lower:
+                styles['bold'] = True
+            if 'italic' in cls_lower or 'emph' in cls_lower:
+                styles['italic'] = True
+            if 'underline' in cls_lower:
+                styles['underline'] = True
+        
+        # Check key-value pairs for inline styles
+        kv_pairs = attr[2]
+        for key, val in kv_pairs:
+            key_lower = key.lower()
+            if key_lower == 'style':
+                # Parse CSS style string
+                for style_part in val.split(';'):
+                    if ':' in style_part:
+                        style_key, style_val = style_part.split(':', 1)
+                        style_key = style_key.strip().lower()
+                        style_val = style_val.strip()
+                        
+                        if style_key == 'color':
+                            styles['color'] = self._convert_color_to_hwp(style_val)
+                        elif style_key == 'font-size':
+                            styles['font-size'] = self._convert_size_to_hwp(style_val)
+                        elif style_key == 'font-weight':
+                            if 'bold' in style_val.lower():
+                                styles['bold'] = True
+                        elif style_key == 'font-style':
+                            if 'italic' in style_val.lower():
+                                styles['italic'] = True
+                        elif style_key == 'text-decoration':
+                            if 'underline' in style_val.lower():
+                                styles['underline'] = True
+                            if 'line-through' in style_val.lower():
+                                styles['strikeout'] = True
         
         return styles
 
     def _parse_styles_and_init_xml(self, header_xml_content):
-        """Parse header.xml to extract style mappings and prepare for modifications"""
-        # Parse XML
-        self.header_tree = ET.ElementTree(ET.fromstring(header_xml_content))
-        self.header_root = self.header_tree.getroot()
-        
-        # Extract existing styles
-        styles = self.header_root.findall('.//hh:style', self.namespaces)
-        for style in styles:
-            style_id = int(style.get('id', 0))
-            eng_name = style.get('engName', '')
-            name = style.get('name', '')
+        """Parse header.xml and initialize style mappings with XML tree"""
+        try:
+            # Register namespaces
+            for prefix, uri in self.namespaces.items():
+                ET.register_namespace(prefix, uri)
             
-            # Map English names to IDs
-            if eng_name:
-                self.dynamic_style_map[eng_name] = style_id
-            if name == '바탕글' or eng_name == 'Normal':
-                self.normal_style_id = style_id
-                para_pr_ref = style.get('paraPrIDRef')
-                if para_pr_ref:
-                    self.normal_para_pr_id = int(para_pr_ref)
-        
-        # Find max charPr ID
-        char_props = self.header_root.findall('.//hh:charPr', self.namespaces)
-        for cp in char_props:
-            cp_id = int(cp.get('id', 0))
-            if cp_id > self.max_char_pr_id:
-                self.max_char_pr_id = cp_id
-        
-        # Find max paraPr ID
-        para_props = self.header_root.findall('.//hh:paraPr', self.namespaces)
-        for pp in para_props:
-            pp_id = int(pp.get('id', 0))
-            if pp_id > self.max_para_pr_id:
-                self.max_para_pr_id = pp_id
+            self.header_tree = ET.ElementTree(ET.fromstring(header_xml_content))
+            self.header_root = self.header_tree.getroot()
+            
+            # Find max IDs
+            for char_pr in self.header_root.findall('.//hh:charPr', self.namespaces):
+                char_id = int(char_pr.get('id', 0))
+                if char_id > self.max_char_pr_id:
+                    self.max_char_pr_id = char_id
+            
+            for para_pr in self.header_root.findall('.//hh:paraPr', self.namespaces):
+                para_id = int(para_pr.get('id', 0))
+                if para_id > self.max_para_pr_id:
+                    self.max_para_pr_id = para_id
+            
+            for border_fill in self.header_root.findall('.//hh:borderFill', self.namespaces):
+                bf_id = int(border_fill.get('id', 0))
+                if bf_id > self.max_border_fill_id:
+                    self.max_border_fill_id = bf_id
+            
+            # Find Normal style
+            styles = self.header_root.findall('.//hh:style', self.namespaces)
+            for style in styles:
+                style_name = style.get('name', '')
+                style_id = int(style.get('id', 0))
+                
+                if style_name == 'Normal' or style_name == '바탕글':
+                    self.normal_style_id = style_id
+                    self.normal_para_pr_id = int(style.get('paraPrIDRef', 1))
+                
+                self.dynamic_style_map[style_name] = style_id
+            
+        except Exception as e:
+            print(f"[Warn] Failed to parse header.xml: {e}", file=sys.stderr)
 
     def _get_or_create_char_pr(self, base_char_pr_id=0, active_formats=None, color=None, font_size=None):
-        """Get or create a character property with the specified formatting"""
+        """Get or create a charPr with specified formatting - using correct HWPX format"""
         if active_formats is None:
             active_formats = set()
+        
+        base_char_pr_id = str(base_char_pr_id)
         
         # Create cache key
         cache_key = (base_char_pr_id, frozenset(active_formats), color, font_size)
         
-        # Return cached ID if exists
         if cache_key in self.char_pr_cache:
             return self.char_pr_cache[cache_key]
         
-        # Find base charPr node
-        base_node = self.header_root.find(f'.//hh:charPr[@id="{base_char_pr_id}"]', self.namespaces)
-        if base_node is None:
+        # If no formatting needed, return base
+        if not active_formats and not color and not font_size:
             return base_char_pr_id
         
-        # Create new charPr node
+        # Create new charPr
+        if self.header_root is None:
+            return base_char_pr_id
+        
+        base_node = self.header_root.find(f'.//hh:charPr[@id="{base_char_pr_id}"]', self.namespaces)
+        if base_node is None:
+            base_node = self.header_root.find('.//hh:charPr[@id="0"]', self.namespaces)
+            if base_node is None:
+                return base_char_pr_id
+        
         new_node = copy.deepcopy(base_node)
         self.max_char_pr_id += 1
         new_id = str(self.max_char_pr_id)
         new_node.set('id', new_id)
         
-        # Apply color
+        # Apply color as ATTRIBUTE (not child element)
         if color:
-            hwp_color = self._convert_color_to_hwp(color)
-            new_node.set('textColor', hwp_color)
+            new_node.set('textColor', color)
+            
+            # Also update underline color if underline exists
+            ul = new_node.find('hh:underline', self.namespaces)
+            if ul is not None:
+                ul.set('color', color)
         
-        # Apply font size
+        # Apply font size as ATTRIBUTE (not child element)
+        # HWPX height: 1000 = 10pt, so multiply pt by 100
         if font_size:
-            hwp_size = self._pt_to_hwp_units(font_size)
-            new_node.set('height', str(hwp_size))
+            new_node.set('height', str(font_size * 100))
         
-        # Apply formatting
+        # Apply formatting using CHILD ELEMENTS
         if 'BOLD' in active_formats:
             if new_node.find('hh:bold', self.namespaces) is None:
                 ET.SubElement(new_node, '{http://www.hancom.co.kr/hwpml/2011/head}bold')
@@ -321,25 +374,24 @@ class PandocToHwpx:
         if 'ITALIC' in active_formats:
             if new_node.find('hh:italic', self.namespaces) is None:
                 ET.SubElement(new_node, '{http://www.hancom.co.kr/hwpml/2011/head}italic')
-        
+                
         if 'UNDERLINE' in active_formats:
-            underline = new_node.find('hh:underline', self.namespaces)
-            if underline is not None:
-                underline.set('type', 'SOLID')
-            else:
+            ul = new_node.find('hh:underline', self.namespaces)
+            if ul is None:
                 ul = ET.SubElement(new_node, '{http://www.hancom.co.kr/hwpml/2011/head}underline')
-                ul.set('type', 'SOLID')
-                ul.set('shape', 'SOLID')
+            ul.set('type', 'BOTTOM')
+            ul.set('shape', 'SOLID')
+            if color:
+                ul.set('color', color)
+            else:
                 ul.set('color', '#000000')
         
         if 'STRIKEOUT' in active_formats:
-            strikeout = new_node.find('hh:strikeout', self.namespaces)
-            if strikeout is not None:
-                strikeout.set('shape', 'SOLID')
-            else:
-                so = ET.SubElement(new_node, '{http://www.hancom.co.kr/hwpml/2011/head}strikeout')
-                so.set('shape', 'SOLID')
-                so.set('color', '#000000')
+            st = new_node.find('hh:strikeout', self.namespaces)
+            if st is None:
+                st = ET.SubElement(new_node, '{http://www.hancom.co.kr/hwpml/2011/head}strikeout')
+            st.set('shape', 'CONTINUOUS')
+            st.set('color', color if color else '#000000')
         
         if 'SUPERSCRIPT' in active_formats:
             sub = new_node.find('hh:subscript', self.namespaces)
@@ -360,189 +412,306 @@ class PandocToHwpx:
         if char_props is not None:
             char_props.append(new_node)
         
-        # Update cache
+        # Cache and return
         self.char_pr_cache[cache_key] = new_id
-        
         return new_id
 
-    # --- LIST HANDLING ---
+    def _escape_text(self, text):
+        return saxutils.escape(text)
+
+    def _create_para_start(self, style_id=0, para_pr_id=1, column_break=0, merged=0):
+        # merged=0 is default
+        return f'<hp:p paraPrIDRef="{para_pr_id}" styleIDRef="{style_id}" pageBreak="0" columnBreak="{column_break}" merged="{merged}">'
+
+    def _create_run_start(self, char_pr_id=0):
+        return f'<hp:run charPrIDRef="{char_pr_id}">'
     
-    ORDERED_NUM_XML = """
-    <hh:numbering id="{id}" start="1" xmlns:hh="http://www.hancom.co.kr/hwpml/2011/head">
-      <hh:paraHead start="1" level="1" align="LEFT" useInstWidth="1" autoIndent="0" widthAdjust="0" textOffsetType="PERCENT" textOffset="50" numFormat="DIGIT" charPrIDRef="4294967295" checkable="0">^1.</hh:paraHead>
-      <hh:paraHead start="1" level="2" align="LEFT" useInstWidth="1" autoIndent="0" widthAdjust="0" textOffsetType="PERCENT" textOffset="50" numFormat="LATIN_CAPITAL" charPrIDRef="4294967295" checkable="0">^2.</hh:paraHead>
-      <hh:paraHead start="1" level="3" align="LEFT" useInstWidth="1" autoIndent="0" widthAdjust="0" textOffsetType="PERCENT" textOffset="50" numFormat="ROMAN_SMALL" charPrIDRef="4294967295" checkable="0">^3.</hh:paraHead>
-      <hh:paraHead start="1" level="4" align="LEFT" useInstWidth="1" autoIndent="0" widthAdjust="0" textOffsetType="PERCENT" textOffset="50" numFormat="DIGIT" charPrIDRef="4294967295" checkable="0">^4.</hh:paraHead>
-      <hh:paraHead start="1" level="5" align="LEFT" useInstWidth="1" autoIndent="0" widthAdjust="0" textOffsetType="PERCENT" textOffset="50" numFormat="LATIN_CAPITAL" charPrIDRef="4294967295" checkable="0">^5.</hh:paraHead>
-      <hh:paraHead start="1" level="6" align="LEFT" useInstWidth="1" autoIndent="0" widthAdjust="0" textOffsetType="PERCENT" textOffset="50" numFormat="ROMAN_SMALL" charPrIDRef="4294967295" checkable="0">^6.</hh:paraHead>
-      <hh:paraHead start="1" level="7" align="LEFT" useInstWidth="1" autoIndent="0" widthAdjust="0" textOffsetType="PERCENT" textOffset="50" numFormat="DIGIT" charPrIDRef="4294967295" checkable="0">^7.</hh:paraHead>
-    </hh:numbering>
-    """
+    def _create_text_run(self, text, char_pr_id=0):
+        run_xml = self._create_run_start(char_pr_id)
+        run_xml += f'<hp:t>{self._escape_text(text)}</hp:t>'
+        run_xml += '</hp:run>'
+        return run_xml
 
-    BULLET_NUM_XML = """
-    <hh:numbering id="{id}" start="1" xmlns:hh="http://www.hancom.co.kr/hwpml/2011/head">
-      <hh:paraHead start="1" level="1" align="LEFT" useInstWidth="1" autoIndent="0" widthAdjust="0" textOffsetType="PERCENT" textOffset="50" numFormat="DIGIT" charPrIDRef="4294967295" checkable="0">●</hh:paraHead>
-      <hh:paraHead start="1" level="2" align="LEFT" useInstWidth="1" autoIndent="0" widthAdjust="0" textOffsetType="PERCENT" textOffset="50" numFormat="DIGIT" charPrIDRef="4294967295" checkable="0">○</hh:paraHead>
-      <hh:paraHead start="1" level="3" align="LEFT" useInstWidth="1" autoIndent="0" widthAdjust="0" textOffsetType="PERCENT" textOffset="50" numFormat="DIGIT" charPrIDRef="4294967295" checkable="0">■</hh:paraHead>
-      <hh:paraHead start="1" level="4" align="LEFT" useInstWidth="1" autoIndent="0" widthAdjust="0" textOffsetType="PERCENT" textOffset="50" numFormat="DIGIT" charPrIDRef="4294967295" checkable="0">●</hh:paraHead>
-      <hh:paraHead start="1" level="5" align="LEFT" useInstWidth="1" autoIndent="0" widthAdjust="0" textOffsetType="PERCENT" textOffset="50" numFormat="DIGIT" charPrIDRef="4294967295" checkable="0">○</hh:paraHead>
-      <hh:paraHead start="1" level="6" align="LEFT" useInstWidth="1" autoIndent="0" widthAdjust="0" textOffsetType="PERCENT" textOffset="50" numFormat="DIGIT" charPrIDRef="4294967295" checkable="0">■</hh:paraHead>
-      <hh:paraHead start="1" level="7" align="LEFT" useInstWidth="1" autoIndent="0" widthAdjust="0" textOffsetType="PERCENT" textOffset="50" numFormat="DIGIT" charPrIDRef="4294967295" checkable="0">●</hh:paraHead>
-    </hh:numbering>
-    """
-
-    def _init_numbering_structure(self, root):
-        numberings_node = root.find('.//hh:numberings', self.namespaces)
-        if numberings_node is None:
-            numberings_node = ET.SubElement(root, '{http://www.hancom.co.kr/hwpml/2011/head}numberings')
-    
-    def _create_numbering(self, type='ORDERED', start_num=1):
-        root = self.header_root
-        max_num_id = 0
-        for num in root.findall('.//hh:numbering', self.namespaces):
-            nid = int(num.get('id', 0))
-            if nid > max_num_id:
-                max_num_id = nid
+    # === ORIGINAL TABLE HANDLING FROM org_PandocToHwpx.py ===
+    def _handle_table(self, content):
+        """Handle table from Pandoc AST - ORIGINAL LOGIC"""
+        # content = [attr, caption, specs, table_head, table_body, table_foot]
+        # Pandoc JSON structure for Table is complex and changes between versions.
+        # Assuming standard Pandoc JSON (recent):
+        # [attr, caption, specs, table_head, table_body, table_foot]
         
-        new_id = str(max_num_id + 1)
+        # attr: [id, [classes], [[key, val]]]
+        # caption: [short_caption, blocks]
+        # specs: [[align, col_width], ...]
+        # table_head: [attr, [row, ...]]
+        # table_body: [ [attr, row_head_columns, [row, ...], [row, ...]] ] (List of bodies)
+        # table_foot: [attr, [row, ...]]
         
-        if type == 'ORDERED':
-            template = self.ORDERED_NUM_XML
-        else:
-            template = self.BULLET_NUM_XML
+        # Row: [attr, [cell, ...]]
+        # Cell: [attr, align, rowspan, colspan, [blocks]]
         
-        xml_str = template.format(id=new_id).strip()
-        new_node = ET.fromstring(xml_str)
+        specs = content[2]
+        table_head = content[3]
+        table_bodies = content[4] 
+        table_foot = content[5]
         
-        new_node.set('start', str(start_num))
+        # 1. Flatten Rows
+        # Collect all rows from head, bodies, foot to determine total row count and structure
+        all_rows = []
         
-        numberings_node = root.find('.//hh:numberings', self.namespaces)
-        if numberings_node is None:
-             self._init_numbering_structure(root)
-             numberings_node = root.find('.//hh:numberings', self.namespaces)
-             
-        numberings_node.append(new_node)
-        return new_id
-
-    def _get_list_para_pr(self, num_id, level):
-        base_id = self.normal_para_pr_id
-        base_node = self.header_root.find(f'.//hh:paraPr[@id="{base_id}"]', self.namespaces)
-        if base_node is None:
-            return base_id 
+        # Head Rows
+        head_rows = table_head[1] # list of rows
+        for row in head_rows:
+            all_rows.append(row)
             
-        new_node = copy.deepcopy(base_node)
-        self.max_para_pr_id += 1
-        new_id = str(self.max_para_pr_id)
-        new_node.set('id', new_id)
-        
-        heading = new_node.find('hh:heading', self.namespaces)
-        if heading is None:
-            heading = ET.SubElement(new_node, '{http://www.hancom.co.kr/hwpml/2011/head}heading')
-        heading.set('type', 'NUMBER')
-        heading.set('idRef', str(num_id))
-        heading.set('level', str(level))
-        
-        indent_per_level = 2000
-        current_indent = (level) * indent_per_level 
-        
-        for margin_node in new_node.findall('.//hc:left', self.namespaces):
-            original_val = int(margin_node.get('value', 0))
-            new_val = original_val + current_indent
-            margin_node.set('value', str(new_val))
+            # Body Rows (Bodies is a list of bodies)
+        for body in table_bodies:
+            # body = [attr, row_head_columns, intermediate_headers, main_rows]
             
-        hanging_val = 2000
-        for intent_node in new_node.findall('.//hc:intent', self.namespaces):
-            intent_node.set('value', str(-hanging_val))
+            # Intermediate Headers (if any)
+            inter_headers = body[2]
+            for row in inter_headers:
+                 all_rows.append(row)
             
-        for left_node in new_node.findall('.//hc:left', self.namespaces):
-            val = (level + 1) * hanging_val
-            left_node.set('value', str(val))
+            # Main Rows
+            main_rows = body[3]
+            for row in main_rows:
+                 all_rows.append(row)
+        
+        # Foot Rows
+        foot_rows = table_foot[1]
+        for row in foot_rows:
+            all_rows.append(row)
+            
+        if not all_rows:
+            return ""
 
-        para_props = self.header_root.find('.//hh:paraProperties', self.namespaces)
-        if para_props is not None:
-            para_props.append(new_node)
-            
-        return new_id
-
-    def _handle_bullet_list(self, content, level=0):
-        num_id = self._create_numbering('BULLET')
+        row_cnt = len(all_rows)
+        col_cnt = len(specs)
         
-        results = []
-        for item_blocks in content:
-            for i, block in enumerate(item_blocks):
-                b_type = block.get('t')
-                b_content = block.get('c')
+        # 2. Calculate Widths
+        # Total Page Width approx 45000 - margins. Let's assume 30000-40000 range.
+        # Sample uses total ~45000.
+        TOTAL_TABLE_WIDTH = 45000
+        col_widths = []
+        
+        for spec in specs:
+            # spec = [align, width_info]
+            # width_info is specific format (e.g. {"t": "ColWidthDefault"}) or explicit float
+            # If float, it's relative?
+            # Let's simplify: split evenly if unknown
+            col_widths.append(int(TOTAL_TABLE_WIDTH / col_cnt))
+            
+        # 3. Generate Table XML
+        import time
+        import random
+        tbl_id = str(int(time.time() * 1000) % 100000000 + random.randint(0, 10000))
+        
+        xml_parts = []
+        
+        # Table Start
+        # We need to wrap table in a Run/Para structure? 
+        # Yes, Table is an inline character-like object in HWPX (like image).
+        # <hp:p><hp:run><hp:tbl ...>...</hp:tbl></hp:run></hp:p>
+        
+        # Para Start
+        xml_parts.append(self._create_para_start(style_id=self.normal_style_id, para_pr_id=self.normal_para_pr_id))
+        xml_parts.append(self._create_run_start(char_pr_id=0)) # Table run charPr=0 usually
+        
+        # Ensure table borderFill exists
+        if self.table_border_fill_id is None:
+            self._ensure_table_border_fill()
+        
+        # Table properties
+        xml_parts.append(f'<hp:tbl id="{tbl_id}" zOrder="0" numberingType="TABLE" textWrap="TOP_AND_BOTTOM" textFlow="BOTH_SIDES" lock="0" dropcapstyle="None" pageBreak="CELL" repeatHeader="1" rowCnt="{row_cnt}" colCnt="{col_cnt}" cellSpacing="0" borderFillIDRef="{self.table_border_fill_id}" noAdjust="0">')
+        
+        # Dimensions
+        xml_parts.append(f'<hp:sz width="{TOTAL_TABLE_WIDTH}" widthRelTo="ABSOLUTE" height="{row_cnt * 1000}" heightRelTo="ABSOLUTE" protect="0"/>')
+        xml_parts.append('<hp:pos treatAsChar="0" affectLSpacing="0" flowWithText="1" allowOverlap="0" holdAnchorAndSO="0" vertRelTo="PARA" horzRelTo="COLUMN" vertAlign="TOP" horzAlign="LEFT" vertOffset="0" horzOffset="0"/>')
+        xml_parts.append('<hp:outMargin left="0" right="0" top="0" bottom="1417"/>')
+        xml_parts.append('<hp:inMargin left="510" right="510" top="141" bottom="141"/>')
+        
+        # 4. Generate Rows
+        occupied_cells = set() # (row, col)
+        curr_row_addr = 0
+        
+        for row in all_rows:
+            # Row = [attr, [cell, ...]]
+            cells = row[1]
+            
+            xml_parts.append('<hp:tr>')
+            
+            curr_col_addr = 0
+            for cell in cells:
+                # Find next free column by skipping occupied cells
+                while (curr_row_addr, curr_col_addr) in occupied_cells:
+                    curr_col_addr += 1
                 
-                list_para_pr = self._get_list_para_pr(num_id, level)
+                actual_col = curr_col_addr
                 
-                if b_type == 'Para' or b_type == 'Plain':
-                     xml = self._create_para_start(style_id=self.normal_style_id, para_pr_id=list_para_pr)
-                     xml += self._process_inlines(b_content)
-                     xml += '</hp:p>'
-                     results.append(xml)
-                elif b_type == 'BulletList':
-                    results.append(self._handle_bullet_list(b_content, level=level+1))
-                elif b_type == 'OrderedList':
-                    results.append(self._handle_ordered_list(b_content, level=level+1))
-                else:
-                    results.append(self._process_blocks([block]))
-
-        return "\n".join(results)
-
-    def _handle_ordered_list(self, content, level=0):
-        attrs = content[0]
-        start_num = attrs[0]
-        items = content[1]
-        
-        num_id = self._create_numbering('ORDERED', start_num=start_num)
-        
-        results = []
-        for item_blocks in items:
-            for block in item_blocks:
-                b_type = block.get('t')
-                b_content = block.get('c')
+                # Cell = [attr, align, rowspan, colspan, [blocks]]
+                # Pandoc cell structure: [attr, align, rowspan, colspan, blocks]
+                rowspan = cell[2]
+                colspan = cell[3]
+                cell_blocks = cell[4]
                 
-                list_para_pr = self._get_list_para_pr(num_id, level)
+                # Mark occupied cells for this span
+                for r in range(rowspan):
+                    for c in range(colspan):
+                        occupied_cells.add((curr_row_addr + r, actual_col + c))
 
-                if b_type == 'Para' or b_type == 'Plain':
-                     xml = self._create_para_start(style_id=self.normal_style_id, para_pr_id=list_para_pr)
-                     xml += self._process_inlines(b_content)
-                     xml += '</hp:p>'
-                     results.append(xml)
-                elif b_type == 'BulletList':
-                     results.append(self._handle_bullet_list(b_content, level=level+1))
-                elif b_type == 'OrderedList':
-                     results.append(self._handle_ordered_list(b_content, level=level+1))
-                else:
-                     results.append(self._process_blocks([block]))
+                # Calculate cell width based on colspan
+                # Sum widths of columns covered
+                cell_width = 0
+                for i in range(colspan):
+                    if actual_col + i < len(col_widths):
+                        cell_width += col_widths[actual_col + i]
+                    else:
+                        cell_width += int(TOTAL_TABLE_WIDTH / col_cnt)
 
-        return "\n".join(results)
+                sublist_id = str(int(time.time() * 100000) % 1000000000 + random.randint(0, 100000))
+                
+                cell_content_xml = self._process_blocks(cell_blocks)
+                
+                # TC Start
+                xml_parts.append(f'<hp:tc name="" header="0" hasMargin="0" protect="0" editable="0" dirty="0" borderFillIDRef="{self.table_border_fill_id}">')
+                
+                # SubList
+                xml_parts.append(f'<hp:subList id="{sublist_id}" textDirection="HORIZONTAL" lineWrap="BREAK" vertAlign="TOP" linkListIDRef="0" linkListNextIDRef="0" textWidth="0" textHeight="0" hasTextRef="0" hasNumRef="0">')
+                xml_parts.append(cell_content_xml)
+                xml_parts.append('</hp:subList>')
+                
+                # Cell Address & Span
+                xml_parts.append(f'<hp:cellAddr colAddr="{actual_col}" rowAddr="{curr_row_addr}"/>')
+                xml_parts.append(f'<hp:cellSpan colSpan="{colspan}" rowSpan="{rowspan}"/>')
+                xml_parts.append(f'<hp:cellSz width="{cell_width}" height="1000"/>')
+                xml_parts.append('<hp:cellMargin left="510" right="510" top="141" bottom="141"/>')
+                
+                xml_parts.append('</hp:tc>')
+                
+                # Advance current column by the span of this cell in the current row
+                curr_col_addr += colspan
+                
+            xml_parts.append('</hp:tr>')
+            curr_row_addr += 1
+            
+        xml_parts.append('</hp:tbl>')
+        xml_parts.append('</hp:run>')
+        xml_parts.append('</hp:p>')
+        
+        return "".join(xml_parts)
 
-    def _create_para_start(self, style_id=0, para_pr_id=None):
-        """Create opening tag for a paragraph"""
-        if para_pr_id is None:
-            para_pr_id = self.normal_para_pr_id
-        return f'<hp:p paraPrIDRef="{para_pr_id}" styleIDRef="{style_id}" pageBreak="0" columnBreak="0" merged="0">'
+    def _ensure_table_border_fill(self):
+        """Ensure a borderFill for tables exists in header.xml"""
+        if self.table_border_fill_id is not None:
+            return self.table_border_fill_id
+        
+        # Create new borderFill ID
+        self.max_border_fill_id += 1
+        self.table_border_fill_id = self.max_border_fill_id
+        
+        # Create borderFill element
+        border_fill_xml = f'''<hh:borderFill xmlns:hh="http://www.hancom.co.kr/hwpml/2011/head" xmlns:hc="http://www.hancom.co.kr/hwpml/2011/core" id="{self.table_border_fill_id}" threeD="0" shadow="0" slash="NONE" backSlash="NONE" crookedSlash="0" counterstrike="0">
+    <hh:leftBorder type="SOLID" width="0.12 mm" color="#000000"/>
+    <hh:rightBorder type="SOLID" width="0.12 mm" color="#000000"/>
+    <hh:topBorder type="SOLID" width="0.12 mm" color="#000000"/>
+    <hh:bottomBorder type="SOLID" width="0.12 mm" color="#000000"/>
+    <hh:diagonal type="NONE" crooked="0"/>
+    <hc:fill>
+      <hc:fillColorPattern type="NONE" foreColor="#FFFFFF" backColor="#FFFFFF"/>
+    </hc:fill>
+</hh:borderFill>'''
+        
+        bf_elem = ET.fromstring(border_fill_xml)
+        bf_container = self.header_root.find('.//hh:borderFills', self.namespaces)
+        if bf_container is None:
+            bf_container = ET.SubElement(self.header_root, '{http://www.hancom.co.kr/hwpml/2011/head}borderFills')
+        bf_container.append(bf_elem)
+        
+        return self.table_border_fill_id
+    # === END ORIGINAL TABLE HANDLING ===
+
+    def _handle_para(self, content):
+        """Handle paragraph with style preservation"""
+        xml = self._create_para_start(style_id=self.normal_style_id, para_pr_id=self.normal_para_pr_id) 
+        xml += self._process_inlines(content) 
+        xml += '</hp:p>'
+        return xml
+
+    def _handle_plain(self, content):
+        """Handle plain text with style preservation"""
+        xml = self._create_para_start(style_id=self.normal_style_id, para_pr_id=self.normal_para_pr_id)
+        xml += self._process_inlines(content)
+        xml += '</hp:p>'
+        return xml
+
+    def _handle_header(self, content):
+        """Handle headers"""
+        level = content[0]
+        inlines = content[2]
+        header_style = min(level, 6)  # Max header level 6
+        
+        xml = self._create_para_start(style_id=header_style)
+        xml += self._process_inlines(inlines)
+        xml += '</hp:p>'
+        return xml
+
+    def _handle_bullet_list(self, list_data):
+        """Handle bullet lists"""
+        items = list_data if isinstance(list_data, list) else []
+        result = []
+        
+        for item in items:
+            if isinstance(item, list):
+                for block in item:
+                    block_type = block.get('t')
+                    content = block.get('c')
+                    
+                    if block_type == 'Plain' or block_type == 'Para':
+                        result.append(self._create_para_start())
+                        result.append('<hp:run charPrIDRef="0"><hp:t>• </hp:t></hp:run>')
+                        result.append(self._process_inlines(content))
+                        result.append('</hp:p>')
+        return "\n".join(result)
+
+    def _handle_ordered_list(self, list_data):
+        """Handle ordered lists"""
+        # list_data = [list_attributes, items]
+        items = list_data[1] if len(list_data) > 1 else []
+        result = []
+        
+        for idx, item in enumerate(items, 1):
+            # Each item is a list of blocks
+            if isinstance(item, list):
+                for block in item:
+                    block_type = block.get('t')
+                    content = block.get('c')
+                    
+                    if block_type == 'Plain' or block_type == 'Para':
+                        result.append(self._create_para_start())
+                        result.append(f'<hp:run charPrIDRef="0"><hp:t>{idx}. </hp:t></hp:run>')
+                        result.append(self._process_inlines(content))
+                        result.append('</hp:p>')
+        return "\n".join(result)
 
     def _process_blocks(self, blocks):
         """Process Pandoc block elements"""
         result = []
         for block in blocks:
+            if not isinstance(block, dict):
+                continue
+                
             block_type = block.get('t')
             content = block.get('c')
             
-            if block_type == 'Para' or block_type == 'Plain':
-                result.append(self._create_para_start())
-                result.append(self._process_inlines(content))
-                result.append('</hp:p>')
+            if block_type == 'Para':
+                result.append(self._handle_para(content))
+                
+            elif block_type == 'Plain':
+                result.append(self._handle_plain(content))
                 
             elif block_type == 'Header':
-                level = content[0]
-                inlines = content[2]
-                header_style = min(level, 6)  # Max header level 6
-                result.append(self._create_para_start(style_id=header_style))
-                result.append(self._process_inlines(inlines))
-                result.append('</hp:p>')
+                result.append(self._handle_header(content))
                 
             elif block_type == 'BulletList':
                 result.append(self._handle_bullet_list(content))
@@ -551,7 +720,9 @@ class PandocToHwpx:
                 result.append(self._handle_ordered_list(content))
                 
             elif block_type == 'Table':
-                result.append(self._process_table(content))
+                table_xml = self._handle_table(content)
+                if table_xml:
+                    result.append(table_xml)
                 
         return "\n".join(result)
 
@@ -645,14 +816,6 @@ class PandocToHwpx:
                 
         return "".join(result)
 
-    def _process_table(self, table_content):
-        """Process table - simplified version"""
-        # This is a placeholder - full table implementation would be complex
-        result = ['<hp:p paraPrIDRef="1" styleIDRef="0" pageBreak="0" columnBreak="0" merged="0">']
-        result.append('<hp:run charPrIDRef="0"><hp:t>[Table content]</hp:t></hp:run>')
-        result.append('</hp:p>')
-        return "\n".join(result)
-
     def process(self):
         """Main processing method"""
         if not self.ast:
@@ -678,6 +841,12 @@ class PandocToHwpx:
         if para_props is not None:
             para_count = len(para_props.findall('hh:paraPr', self.namespaces))
             para_props.set('itemCnt', str(para_count))
+        
+        # Update itemCnt for borderFills
+        border_fills = self.header_root.find('.//hh:borderFills', self.namespaces)
+        if border_fills is not None:
+            border_fill_count = len(border_fills.findall('hh:borderFill', self.namespaces))
+            border_fills.set('itemCnt', str(border_fill_count))
         
         return ET.tostring(self.header_root, encoding='unicode', method='xml')
 
@@ -726,7 +895,7 @@ class PandocToHwpx:
         </hp:footNotePr>
         <hp:endNotePr>
           <hp:autoNumFormat type="ROMAN_SMALL" userChar="" prefixChar="" suffixChar="" supscript="1"/>
-          <hp:noteLine length="-1" type="SOLID" width="0.25 mm" color="#000000"/>
+          <hp:noteLine length="-1" type="SOLID" width="0.12 mm" color="#000000"/>
           <hp:noteSpacing betweenNotes="0" belowLine="0" aboveLine="1000"/>
           <hp:numbering type="CONTINUOUS" newNum="1"/>
           <hp:placement place="END_OF_DOCUMENT" beneathText="0"/>
