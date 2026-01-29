@@ -24,3 +24,7 @@ ENV/
 
 # Project specifics
 *.log
+test_files/
+hwpx_unziiped/
+output.hwpx
+output.html
