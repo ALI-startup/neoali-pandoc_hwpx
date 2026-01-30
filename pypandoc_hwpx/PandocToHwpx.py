@@ -18,6 +18,7 @@ class HTMLStyleExtractor(HTMLParser):
         super().__init__()
         self.style_stack = []
         self.text_segments = []
+        self.para_styles = []  # NEW: Track paragraph-level styles
         
     def handle_starttag(self, tag, attrs):
         style_dict = {}
@@ -30,6 +31,10 @@ class HTMLStyleExtractor(HTMLParser):
                         key = key.strip().lower()
                         val = val.strip()
                         style_dict[key] = val
+        
+        # NEW: Track paragraph-level styles
+        if tag == 'p':
+            self.para_styles.append(style_dict.copy())
         
         # Handle semantic tags
         if tag == 'strong' or tag == 'b':
@@ -55,12 +60,65 @@ class HTMLStyleExtractor(HTMLParser):
                 combined_style.update(style)
             self.text_segments.append((data, combined_style.copy()))
 
+class HTMLParagraphStyleExtractor(HTMLParser):
+    """Extract paragraph-level styles from HTML before Pandoc processing"""
+    def __init__(self):
+        super().__init__()
+        self.para_styles = {}  # Map content_hash -> styles_dict
+        self.current_para_content = []
+        self.current_para_styles = {}
+        self.in_paragraph = False
+        
+    def handle_starttag(self, tag, attrs):
+        if tag == 'p':
+            self.in_paragraph = True
+            self.current_para_content = []
+            attrs_dict = dict(attrs)
+            self.current_para_styles = {}
+            
+            if 'style' in attrs_dict:
+                for style_part in attrs_dict['style'].split(';'):
+                    if ':' in style_part:
+                        key, val = style_part.split(':', 1)
+                        key = key.strip().lower()
+                        val = val.strip()
+                        
+                        if key == 'padding-left':
+                            self.current_para_styles['padding-left'] = val
+                        elif key == 'margin-left':
+                            self.current_para_styles['margin-left'] = val
+                        elif key == 'text-indent':
+                            self.current_para_styles['text-indent'] = val
+    
+    def handle_endtag(self, tag):
+        if tag == 'p' and self.in_paragraph:
+            # Create a hash from the paragraph content
+            content_text = ''.join(self.current_para_content).strip()
+            if content_text and self.current_para_styles:
+                # Use first 100 chars as key to identify paragraph
+                content_key = content_text[:100]
+                self.para_styles[content_key] = self.current_para_styles.copy()
+            
+            self.in_paragraph = False
+            self.current_para_content = []
+            self.current_para_styles = {}
+    
+    def handle_data(self, data):
+        if self.in_paragraph:
+            self.current_para_content.append(data)
+
+
 class PandocToHwpx:
     def __init__(self, json_ast=None, header_xml_content=None, html_content=None):
         self.ast = json_ast
         self.output = []
         self.header_xml_content = header_xml_content
         self.html_content = html_content
+        
+        # NEW: Extract paragraph styles from HTML before processing
+        self.html_para_styles = {}  # Map para_index -> styles_dict
+        if html_content:
+            self._extract_html_para_styles(html_content)
         
         # Default Style Mappings (Fallback)
         self.STYLE_MAP = {
@@ -93,6 +151,9 @@ class PandocToHwpx:
         self.max_para_pr_id = 0
         self.max_border_fill_id = 0
         
+        # NEW: ParaPr cache for indented paragraphs
+        self.para_pr_cache = {}  # key: (padding_left, text_indent) -> para_pr_id
+        
         self.images = [] # metadata for images
         
         # Table-related attributes (from original)
@@ -104,6 +165,17 @@ class PandocToHwpx:
 
         if self.header_xml_content:
             self._parse_styles_and_init_xml(self.header_xml_content)
+
+    def _extract_html_para_styles(self, html_content):
+        """Extract paragraph styles from HTML before Pandoc processes it"""
+        try:
+            extractor = HTMLParagraphStyleExtractor()
+            extractor.feed(html_content)
+            
+            # Store content-based styles dictionary
+            self.html_para_styles = extractor.para_styles
+        except Exception as e:
+            print(f"[Warn] Failed to extract HTML paragraph styles: {e}", file=sys.stderr)
 
     def _extract_metadata(self):
         if not self.ast:
@@ -276,6 +348,13 @@ class PandocToHwpx:
                                 styles['underline'] = True
                             if 'line-through' in style_val.lower():
                                 styles['strikeout'] = True
+                        # NEW: Extract padding/indent for paragraphs
+                        elif style_key == 'padding-left':
+                            styles['padding-left'] = self._convert_size_to_hwp(style_val)
+                        elif style_key == 'margin-left':
+                            styles['margin-left'] = self._convert_size_to_hwp(style_val)
+                        elif style_key == 'text-indent':
+                            styles['text-indent'] = self._convert_size_to_hwp(style_val)
         
         return styles
 
@@ -414,6 +493,99 @@ class PandocToHwpx:
         
         # Cache and return
         self.char_pr_cache[cache_key] = new_id
+        return new_id
+
+    def _get_or_create_para_pr(self, padding_left=0, text_indent=0):
+        """NEW: Get or create a paraPr with specified indentation"""
+        # Convert pt to HWPUNIT (1pt ≈ 100 HWPUNIT)
+        left_margin = int(padding_left * 100) if padding_left else 0
+        indent_val = int(text_indent * 100) if text_indent else 0
+        
+        # Create cache key
+        cache_key = (left_margin, indent_val)
+        
+        if cache_key in self.para_pr_cache:
+            return self.para_pr_cache[cache_key]
+        
+        # If no indentation, return normal
+        if left_margin == 0 and indent_val == 0:
+            return str(self.normal_para_pr_id)
+        
+        # Create new paraPr
+        if self.header_root is None:
+            return str(self.normal_para_pr_id)
+        
+        # Get base paraPr
+        base_node = self.header_root.find(f'.//hh:paraPr[@id="{self.normal_para_pr_id}"]', self.namespaces)
+        if base_node is None:
+            base_node = self.header_root.find('.//hh:paraPr[@id="0"]', self.namespaces)
+            if base_node is None:
+                return str(self.normal_para_pr_id)
+        
+        new_node = copy.deepcopy(base_node)
+        self.max_para_pr_id += 1
+        new_id = str(self.max_para_pr_id)
+        new_node.set('id', new_id)
+        
+        # Add or modify margin element
+        # Look for existing switch/case/margin structure
+        switch_elem = new_node.find('hp:switch', self.namespaces)
+        if switch_elem is None:
+            switch_elem = ET.SubElement(new_node, '{http://www.hancom.co.kr/hwpml/2011/paragraph}switch')
+        
+        case_elem = switch_elem.find('hp:case', self.namespaces)
+        if case_elem is None:
+            case_elem = ET.SubElement(switch_elem, '{http://www.hancom.co.kr/hwpml/2011/paragraph}case')
+            case_elem.set('{http://www.hancom.co.kr/hwpml/2011/paragraph}required-namespace', 
+                         'http://www.hancom.co.kr/hwpml/2016/HwpUnitChar')
+        
+        margin_elem = case_elem.find('hh:margin', self.namespaces)
+        if margin_elem is None:
+            margin_elem = ET.SubElement(case_elem, '{http://www.hancom.co.kr/hwpml/2011/head}margin')
+        
+        # Set margin values
+        # intent = text-indent (negative for hanging indent)
+        # left = padding-left/margin-left
+        intent_elem = margin_elem.find('hc:intent', self.namespaces)
+        if intent_elem is None:
+            intent_elem = ET.SubElement(margin_elem, '{http://www.hancom.co.kr/hwpml/2011/core}intent')
+        intent_elem.set('value', str(indent_val))
+        intent_elem.set('unit', 'HWPUNIT')
+        
+        left_elem = margin_elem.find('hc:left', self.namespaces)
+        if left_elem is None:
+            left_elem = ET.SubElement(margin_elem, '{http://www.hancom.co.kr/hwpml/2011/core}left')
+        left_elem.set('value', str(left_margin))
+        left_elem.set('unit', 'HWPUNIT')
+        
+        # Also add to default
+        default_elem = switch_elem.find('hp:default', self.namespaces)
+        if default_elem is None:
+            default_elem = ET.SubElement(switch_elem, '{http://www.hancom.co.kr/hwpml/2011/paragraph}default')
+        
+        default_margin = default_elem.find('hh:margin', self.namespaces)
+        if default_margin is None:
+            default_margin = ET.SubElement(default_elem, '{http://www.hancom.co.kr/hwpml/2011/head}margin')
+        
+        default_intent = default_margin.find('hc:intent', self.namespaces)
+        if default_intent is None:
+            default_intent = ET.SubElement(default_margin, '{http://www.hancom.co.kr/hwpml/2011/core}intent')
+        default_intent.set('value', str(indent_val))
+        default_intent.set('unit', 'HWPUNIT')
+        
+        default_left = default_margin.find('hc:left', self.namespaces)
+        if default_left is None:
+            default_left = ET.SubElement(default_margin, '{http://www.hancom.co.kr/hwpml/2011/core}left')
+        default_left.set('value', str(left_margin))
+        default_left.set('unit', 'HWPUNIT')
+        
+        # Add to header
+        para_props = self.header_root.find('.//hh:paraProperties', self.namespaces)
+        if para_props is not None:
+            para_props.append(new_node)
+        
+        # Cache and return
+        self.para_pr_cache[cache_key] = new_id
         return new_id
 
     def _escape_text(self, text):
@@ -631,16 +803,70 @@ class PandocToHwpx:
         return self.table_border_fill_id
     # === END ORIGINAL TABLE HANDLING ===
 
-    def _handle_para(self, content):
-        """Handle paragraph with style preservation"""
-        xml = self._create_para_start(style_id=self.normal_style_id, para_pr_id=self.normal_para_pr_id) 
+    def _handle_para(self, content, para_styles=None):
+        """Handle paragraph with style preservation - UPDATED to support indentation"""
+        # NEW: Get paragraph styles from pre-extracted HTML styles based on content
+        if para_styles is None and self.html_para_styles:
+            # Extract text content from this paragraph to match against HTML
+            para_text = self._get_plain_text(content)[:100]  # First 100 chars
+            
+            if para_text in self.html_para_styles:
+                html_styles = self.html_para_styles[para_text]
+                para_styles = {}
+                
+                if 'padding-left' in html_styles:
+                    para_styles['padding-left'] = self._convert_size_to_hwp(html_styles['padding-left'])
+                if 'margin-left' in html_styles:
+                    para_styles['margin-left'] = self._convert_size_to_hwp(html_styles['margin-left'])
+                if 'text-indent' in html_styles:
+                    para_styles['text-indent'] = self._convert_size_to_hwp(html_styles['text-indent'])
+        
+        # Check for paragraph-level indentation styles
+        padding_left = 0
+        text_indent = 0
+        
+        if para_styles:
+            padding_left = para_styles.get('padding-left', 0) or para_styles.get('margin-left', 0)
+            text_indent = para_styles.get('text-indent', 0)
+        
+        # Get or create paraPr with indentation
+        para_pr_id = self._get_or_create_para_pr(padding_left, text_indent)
+        
+        xml = self._create_para_start(style_id=self.normal_style_id, para_pr_id=para_pr_id) 
         xml += self._process_inlines(content) 
         xml += '</hp:p>'
         return xml
 
-    def _handle_plain(self, content):
-        """Handle plain text with style preservation"""
-        xml = self._create_para_start(style_id=self.normal_style_id, para_pr_id=self.normal_para_pr_id)
+    def _handle_plain(self, content, para_styles=None):
+        """Handle plain text with style preservation - UPDATED to support indentation"""
+        # NEW: Get paragraph styles from pre-extracted HTML styles based on content
+        if para_styles is None and self.html_para_styles:
+            # Extract text content from this paragraph to match against HTML
+            para_text = self._get_plain_text(content)[:100]  # First 100 chars
+            
+            if para_text in self.html_para_styles:
+                html_styles = self.html_para_styles[para_text]
+                para_styles = {}
+                
+                if 'padding-left' in html_styles:
+                    para_styles['padding-left'] = self._convert_size_to_hwp(html_styles['padding-left'])
+                if 'margin-left' in html_styles:
+                    para_styles['margin-left'] = self._convert_size_to_hwp(html_styles['margin-left'])
+                if 'text-indent' in html_styles:
+                    para_styles['text-indent'] = self._convert_size_to_hwp(html_styles['text-indent'])
+        
+        # Check for paragraph-level indentation styles
+        padding_left = 0
+        text_indent = 0
+        
+        if para_styles:
+            padding_left = para_styles.get('padding-left', 0) or para_styles.get('margin-left', 0)
+            text_indent = para_styles.get('text-indent', 0)
+        
+        # Get or create paraPr with indentation
+        para_pr_id = self._get_or_create_para_pr(padding_left, text_indent)
+        
+        xml = self._create_para_start(style_id=self.normal_style_id, para_pr_id=para_pr_id)
         xml += self._process_inlines(content)
         xml += '</hp:p>'
         return xml
