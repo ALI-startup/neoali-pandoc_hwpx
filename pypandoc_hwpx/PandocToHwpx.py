@@ -1077,21 +1077,21 @@ class PandocToHwpx:
         return ET.tostring(self.header_root, encoding='unicode', method='xml')
 
     @staticmethod
-    def convert_to_hwpx(input_file, output_file, reference_hwpx):
+    def convert_to_hwpx(input_path, output_path, reference_path):
         """Convert input file to HWPX format using reference template"""
         # Read reference HWPX
-        with zipfile.ZipFile(reference_hwpx, 'r') as ref_zip:
+        with zipfile.ZipFile(reference_path, 'r') as ref_zip:
             header_xml = ref_zip.read('Contents/header.xml').decode('utf-8')
             section0_xml = ref_zip.read('Contents/section0.xml').decode('utf-8')
         
         # Read input file content if it's HTML
         html_content = None
-        if input_file.lower().endswith('.html'):
-            with open(input_file, 'r', encoding='utf-8') as f:
+        if input_path.lower().endswith('.html'):
+            with open(input_path, 'r', encoding='utf-8') as f:
                 html_content = f.read()
         
         # Convert to JSON AST using pypandoc
-        json_str = pypandoc.convert_file(input_file, 'json', format=None)
+        json_str = pypandoc.convert_file(input_path, 'json', format=None)
         ast = json.loads(json_str)
         
         # Process with style preservation
@@ -1148,9 +1148,9 @@ class PandocToHwpx:
 </hs:sec>'''
         
         # Create output HWPX
-        with zipfile.ZipFile(output_file, 'w', zipfile.ZIP_DEFLATED) as out_zip:
+        with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as out_zip:
             # Copy all files from reference except header.xml and section0.xml
-            with zipfile.ZipFile(reference_hwpx, 'r') as ref_zip:
+            with zipfile.ZipFile(reference_path, 'r') as ref_zip:
                 for item in ref_zip.namelist():
                     if item not in ['Contents/header.xml', 'Contents/section0.xml']:
                         out_zip.writestr(item, ref_zip.read(item))
