@@ -218,6 +218,8 @@ class PandocToHwpx:
             elif t == 'Quoted':
                  # c = [quoteType, [inlines]]
                  text.append('"' + self._get_plain_text(c[1]) + '"')
+            elif t == 'LineBreak' or t == 'SoftBreak':
+                 text.append("\n")
         return "".join(text)
 
     def _convert_color_to_hwp(self, color):
@@ -604,51 +606,30 @@ class PandocToHwpx:
         run_xml += '</hp:run>'
         return run_xml
 
-    # === ORIGINAL TABLE HANDLING FROM org_PandocToHwpx.py ===
     def _handle_table(self, content):
-        """Handle table from Pandoc AST - ORIGINAL LOGIC"""
-        # content = [attr, caption, specs, table_head, table_body, table_foot]
-        # Pandoc JSON structure for Table is complex and changes between versions.
-        # Assuming standard Pandoc JSON (recent):
-        # [attr, caption, specs, table_head, table_body, table_foot]
-        
-        # attr: [id, [classes], [[key, val]]]
-        # caption: [short_caption, blocks]
-        # specs: [[align, col_width], ...]
-        # table_head: [attr, [row, ...]]
-        # table_body: [ [attr, row_head_columns, [row, ...], [row, ...]] ] (List of bodies)
-        # table_foot: [attr, [row, ...]]
-        
-        # Row: [attr, [cell, ...]]
-        # Cell: [attr, align, rowspan, colspan, [blocks]]
-        
+        """Handle table from Pandoc AST with proper spanning cell support"""
         specs = content[2]
         table_head = content[3]
         table_bodies = content[4] 
         table_foot = content[5]
         
         # 1. Flatten Rows
-        # Collect all rows from head, bodies, foot to determine total row count and structure
         all_rows = []
         
         # Head Rows
-        head_rows = table_head[1] # list of rows
+        head_rows = table_head[1]
         for row in head_rows:
             all_rows.append(row)
             
-            # Body Rows (Bodies is a list of bodies)
+        # Body Rows
         for body in table_bodies:
-            # body = [attr, row_head_columns, intermediate_headers, main_rows]
-            
-            # Intermediate Headers (if any)
             inter_headers = body[2]
             for row in inter_headers:
-                 all_rows.append(row)
+                all_rows.append(row)
             
-            # Main Rows
             main_rows = body[3]
             for row in main_rows:
-                 all_rows.append(row)
+                all_rows.append(row)
         
         # Foot Rows
         foot_rows = table_foot[1]
@@ -658,37 +639,56 @@ class PandocToHwpx:
         if not all_rows:
             return ""
 
-        row_cnt = len(all_rows)
-        col_cnt = len(specs)
+        # 2. Build cell grid to determine actual table dimensions
+        cell_grid = {}  # (row, col) -> cell_info
+        max_row = 0
+        max_col = 0
         
-        # 2. Calculate Widths
-        # Total Page Width approx 45000 - margins. Let's assume 30000-40000 range.
-        # Sample uses total ~45000.
-        TOTAL_TABLE_WIDTH = 45000
-        col_widths = []
-        
-        for spec in specs:
-            # spec = [align, width_info]
-            # width_info is specific format (e.g. {"t": "ColWidthDefault"}) or explicit float
-            # If float, it's relative?
-            # Let's simplify: split evenly if unknown
-            col_widths.append(int(TOTAL_TABLE_WIDTH / col_cnt))
+        for row_idx, row in enumerate(all_rows):
+            cells = row[1]
+            curr_col = 0
             
-        # 3. Generate Table XML
+            for cell in cells:
+                # Find next free column
+                while (row_idx, curr_col) in cell_grid:
+                    curr_col += 1
+                
+                rowspan = cell[2]
+                colspan = cell[3]
+                
+                # Mark all cells occupied by this cell
+                for r in range(rowspan):
+                    for c in range(colspan):
+                        cell_grid[(row_idx + r, curr_col + c)] = {
+                            'origin_row': row_idx,
+                            'origin_col': curr_col,
+                            'rowspan': rowspan,
+                            'colspan': colspan,
+                            'blocks': cell[4]
+                        }
+                
+                max_row = max(max_row, row_idx + rowspan - 1)
+                max_col = max(max_col, curr_col + colspan - 1)
+                
+                curr_col += colspan
+        
+        row_cnt = max_row + 1
+        col_cnt = max_col + 1
+        
+        # 3. Calculate Widths
+        TOTAL_TABLE_WIDTH = 45000
+        col_widths = [int(TOTAL_TABLE_WIDTH / col_cnt) for _ in range(col_cnt)]
+            
+        # 4. Generate Table XML
         import time
         import random
         tbl_id = str(int(time.time() * 1000) % 100000000 + random.randint(0, 10000))
         
         xml_parts = []
         
-        # Table Start
-        # We need to wrap table in a Run/Para structure? 
-        # Yes, Table is an inline character-like object in HWPX (like image).
-        # <hp:p><hp:run><hp:tbl ...>...</hp:tbl></hp:run></hp:p>
-        
         # Para Start
         xml_parts.append(self._create_para_start(style_id=self.normal_style_id, para_pr_id=self.normal_para_pr_id))
-        xml_parts.append(self._create_run_start(char_pr_id=0)) # Table run charPr=0 usually
+        xml_parts.append(self._create_run_start(char_pr_id=0))
         
         # Ensure table borderFill exists
         if self.table_border_fill_id is None:
@@ -703,47 +703,45 @@ class PandocToHwpx:
         xml_parts.append('<hp:outMargin left="0" right="0" top="0" bottom="1417"/>')
         xml_parts.append('<hp:inMargin left="510" right="510" top="141" bottom="141"/>')
         
-        # 4. Generate Rows
-        occupied_cells = set() # (row, col)
-        curr_row_addr = 0
+        # 5. Generate Rows - only create cells for origin positions
+        processed_cells = set()
         
-        for row in all_rows:
-            # Row = [attr, [cell, ...]]
-            cells = row[1]
-            
+        for row_idx in range(row_cnt):
             xml_parts.append('<hp:tr>')
             
-            curr_col_addr = 0
-            for cell in cells:
-                # Find next free column by skipping occupied cells
-                while (curr_row_addr, curr_col_addr) in occupied_cells:
-                    curr_col_addr += 1
+            for col_idx in range(col_cnt):
+                if (row_idx, col_idx) not in cell_grid:
+                    continue
+                    
+                cell_info = cell_grid[(row_idx, col_idx)]
                 
-                actual_col = curr_col_addr
+                # Only process if this is the origin cell
+                if cell_info['origin_row'] != row_idx or cell_info['origin_col'] != col_idx:
+                    continue
                 
-                # Cell = [attr, align, rowspan, colspan, [blocks]]
-                # Pandoc cell structure: [attr, align, rowspan, colspan, blocks]
-                rowspan = cell[2]
-                colspan = cell[3]
-                cell_blocks = cell[4]
+                # Prevent duplicate processing
+                cell_key = (row_idx, col_idx)
+                if cell_key in processed_cells:
+                    continue
+                processed_cells.add(cell_key)
                 
-                # Mark occupied cells for this span
-                for r in range(rowspan):
-                    for c in range(colspan):
-                        occupied_cells.add((curr_row_addr + r, actual_col + c))
-
-                # Calculate cell width based on colspan
-                # Sum widths of columns covered
-                cell_width = 0
-                for i in range(colspan):
-                    if actual_col + i < len(col_widths):
-                        cell_width += col_widths[actual_col + i]
-                    else:
-                        cell_width += int(TOTAL_TABLE_WIDTH / col_cnt)
-
+                rowspan = cell_info['rowspan']
+                colspan = cell_info['colspan']
+                cell_blocks = cell_info['blocks']
+                
+                # Calculate cell width
+                cell_width = sum(col_widths[col_idx:col_idx + colspan])
+                
                 sublist_id = str(int(time.time() * 100000) % 1000000000 + random.randint(0, 100000))
                 
-                cell_content_xml = self._process_blocks(cell_blocks)
+                # Process cell content
+                cell_content_xml = self._process_blocks_for_table_cell(cell_blocks)
+                
+                # If cell content is empty, add empty paragraph
+                if not cell_content_xml.strip():
+                    cell_content_xml = self._create_para_start(style_id=self.normal_style_id, para_pr_id=self.normal_para_pr_id)
+                    cell_content_xml += '<hp:run charPrIDRef="0"><hp:t></hp:t></hp:run>'
+                    cell_content_xml += '</hp:p>'
                 
                 # TC Start
                 xml_parts.append(f'<hp:tc name="" header="0" hasMargin="0" protect="0" editable="0" dirty="0" borderFillIDRef="{self.table_border_fill_id}">')
@@ -754,18 +752,14 @@ class PandocToHwpx:
                 xml_parts.append('</hp:subList>')
                 
                 # Cell Address & Span
-                xml_parts.append(f'<hp:cellAddr colAddr="{actual_col}" rowAddr="{curr_row_addr}"/>')
+                xml_parts.append(f'<hp:cellAddr colAddr="{col_idx}" rowAddr="{row_idx}"/>')
                 xml_parts.append(f'<hp:cellSpan colSpan="{colspan}" rowSpan="{rowspan}"/>')
                 xml_parts.append(f'<hp:cellSz width="{cell_width}" height="1000"/>')
                 xml_parts.append('<hp:cellMargin left="510" right="510" top="141" bottom="141"/>')
                 
                 xml_parts.append('</hp:tc>')
                 
-                # Advance current column by the span of this cell in the current row
-                curr_col_addr += colspan
-                
             xml_parts.append('</hp:tr>')
-            curr_row_addr += 1
             
         xml_parts.append('</hp:tbl>')
         xml_parts.append('</hp:run>')
@@ -801,7 +795,106 @@ class PandocToHwpx:
         bf_container.append(bf_elem)
         
         return self.table_border_fill_id
-    # === END ORIGINAL TABLE HANDLING ===
+
+    def _process_blocks_for_table_cell(self, blocks):
+        """Process Pandoc block elements specifically for table cells - handles linebreaks properly"""
+        result = []
+        for block_idx, block in enumerate(blocks):
+            if not isinstance(block, dict):
+                continue
+                
+            block_type = block.get('t')
+            content = block.get('c')
+            
+            if block_type == 'Para':
+                # For Para in table cells, process with linebreak awareness
+                result.append(self._handle_para_in_table(content))
+                
+            elif block_type == 'Plain':
+                # For Plain in table cells, process with linebreak awareness
+                result.append(self._handle_plain_in_table(content))
+                
+            elif block_type == 'Header':
+                result.append(self._handle_header(content))
+                
+            elif block_type == 'BulletList':
+                result.append(self._handle_bullet_list(content))
+                
+            elif block_type == 'OrderedList':
+                result.append(self._handle_ordered_list(content))
+                
+            elif block_type == 'Table':
+                # Nested table
+                table_xml = self._handle_table(content)
+                if table_xml:
+                    result.append(table_xml)
+                
+        return "\n".join(result)
+
+    def _handle_para_in_table(self, content):
+        """Handle paragraph in table cell - convert LineBreak to separate paragraphs"""
+        # Split content by LineBreak
+        segments = self._split_by_linebreak(content)
+        
+        result = []
+        for segment in segments:
+            if segment:  # Skip empty segments
+                xml = self._create_para_start(style_id=self.normal_style_id, para_pr_id=self.normal_para_pr_id)
+                xml += self._process_inlines(segment)
+                xml += '</hp:p>'
+                result.append(xml)
+        
+        # If no segments, return empty paragraph
+        if not result:
+            xml = self._create_para_start(style_id=self.normal_style_id, para_pr_id=self.normal_para_pr_id)
+            xml += '<hp:run charPrIDRef="0"><hp:t></hp:t></hp:run>'
+            xml += '</hp:p>'
+            result.append(xml)
+        
+        return "\n".join(result)
+
+    def _handle_plain_in_table(self, content):
+        """Handle plain text in table cell - convert LineBreak to separate paragraphs"""
+        # Split content by LineBreak
+        segments = self._split_by_linebreak(content)
+        
+        result = []
+        for segment in segments:
+            if segment:  # Skip empty segments
+                xml = self._create_para_start(style_id=self.normal_style_id, para_pr_id=self.normal_para_pr_id)
+                xml += self._process_inlines(segment)
+                xml += '</hp:p>'
+                result.append(xml)
+        
+        # If no segments, return empty paragraph
+        if not result:
+            xml = self._create_para_start(style_id=self.normal_style_id, para_pr_id=self.normal_para_pr_id)
+            xml += '<hp:run charPrIDRef="0"><hp:t></hp:t></hp:run>'
+            xml += '</hp:p>'
+            result.append(xml)
+        
+        return "\n".join(result)
+
+    def _split_by_linebreak(self, inlines):
+        """Split a list of inlines by LineBreak elements into segments"""
+        segments = []
+        current_segment = []
+        
+        for inline in inlines:
+            inline_type = inline.get('t')
+            
+            if inline_type == 'LineBreak':
+                # End current segment and start new one
+                segments.append(current_segment)
+                current_segment = []
+            else:
+                current_segment.append(inline)
+        
+        # Add the last segment
+        if current_segment:
+            segments.append(current_segment)
+        
+        return segments
 
     def _handle_para(self, content, para_styles=None):
         """Handle paragraph with style preservation - UPDATED to support indentation"""
@@ -883,7 +976,7 @@ class PandocToHwpx:
         return xml
 
     def _handle_bullet_list(self, list_data):
-        """Handle bullet lists"""
+        """Handle bullet lists with proper formatting"""
         items = list_data if isinstance(list_data, list) else []
         result = []
         
@@ -898,10 +991,16 @@ class PandocToHwpx:
                         result.append('<hp:run charPrIDRef="0"><hp:t>• </hp:t></hp:run>')
                         result.append(self._process_inlines(content))
                         result.append('</hp:p>')
+                    elif block_type == 'BulletList':
+                        # Nested bullet list
+                        result.append(self._handle_bullet_list(content))
+                    elif block_type == 'OrderedList':
+                        # Nested ordered list
+                        result.append(self._handle_ordered_list(content))
         return "\n".join(result)
 
     def _handle_ordered_list(self, list_data):
-        """Handle ordered lists"""
+        """Handle ordered lists with proper formatting"""
         # list_data = [list_attributes, items]
         items = list_data[1] if len(list_data) > 1 else []
         result = []
@@ -918,6 +1017,12 @@ class PandocToHwpx:
                         result.append(f'<hp:run charPrIDRef="0"><hp:t>{idx}. </hp:t></hp:run>')
                         result.append(self._process_inlines(content))
                         result.append('</hp:p>')
+                    elif block_type == 'BulletList':
+                        # Nested bullet list
+                        result.append(self._handle_bullet_list(content))
+                    elif block_type == 'OrderedList':
+                        # Nested ordered list
+                        result.append(self._handle_ordered_list(content))
         return "\n".join(result)
 
     def _process_blocks(self, blocks):
@@ -953,7 +1058,7 @@ class PandocToHwpx:
         return "\n".join(result)
 
     def _process_inlines(self, inlines, active_formats=None, base_color=None, base_size=None):
-        """Process inline elements with style preservation"""
+        """Process inline elements with style preservation - ENHANCED to handle all formatting"""
         if active_formats is None:
             active_formats = set()
         
@@ -1038,7 +1143,30 @@ class PandocToHwpx:
                 result.append(self._process_inlines(span_inlines, new_formats, new_color, new_size))
                 
             elif inline_type == 'LineBreak':
+                # LineBreak is handled at paragraph level in table cells
+                # For normal paragraphs, add line segment
                 result.append('<hp:lineseg/>')
+                
+            elif inline_type == 'SoftBreak':
+                # Soft breaks become spaces in HWPX
+                char_pr_id = self._get_or_create_char_pr(
+                    base_char_pr_id=0,
+                    active_formats=active_formats,
+                    color=base_color,
+                    font_size=base_size
+                )
+                result.append(f'<hp:run charPrIDRef="{char_pr_id}"><hp:t> </hp:t></hp:run>')
+                
+            elif inline_type == 'Code':
+                # Inline code - use monospace styling if available
+                char_pr_id = self._get_or_create_char_pr(
+                    base_char_pr_id=0,
+                    active_formats=active_formats,
+                    color=base_color,
+                    font_size=base_size
+                )
+                text = saxutils.escape(content[1])  # content = [attr, text]
+                result.append(f'<hp:run charPrIDRef="{char_pr_id}"><hp:t>{text}</hp:t></hp:run>')
                 
         return "".join(result)
 
