@@ -686,7 +686,10 @@ class PandocToHwpx:
         Falls back to 0 if the paraPr or its margin element cannot be found.
         """
         # Fast path: check para_pr_cache in reverse to find matching left_margin
-        for (left_margin, _indent), pid in self.para_pr_cache.items():
+        for cache_key, pid in self.para_pr_cache.items():
+            if not isinstance(cache_key, tuple) or len(cache_key) != 2:
+                continue
+            left_margin, _indent = cache_key
             if pid == str(para_pr_id):
                 return left_margin
 
@@ -821,19 +824,21 @@ class PandocToHwpx:
         if self.table_border_fill_id is None:
             self._ensure_table_border_fill()
 
-        # Derive horizontal offset from the paraPr's left-margin so the table
-        # visually aligns with the surrounding list text.
-        horz_offset = self._get_left_margin_from_para_pr(effective_para_pr_id)
-        # Shrink table so it stays within the page column after the indent
-        effective_width = TOTAL_TABLE_WIDTH - horz_offset
+        # The paraPr left-margin already shifts the entire paragraph (and the
+        # table inside it) to the correct list indent position.  horzOffset
+        # must therefore stay at 0 to avoid a second, additive shift.
+        # We still shrink the table width by the indent amount so it doesn't
+        # overflow the right page margin.
+        para_left_margin = self._get_left_margin_from_para_pr(effective_para_pr_id)
+        effective_width = TOTAL_TABLE_WIDTH - para_left_margin
         col_widths = [int(effective_width / col_cnt) for _ in range(col_cnt)]
         
         # Table properties
         xml_parts.append(f'<hp:tbl id="{tbl_id}" zOrder="0" numberingType="TABLE" textWrap="TOP_AND_BOTTOM" textFlow="BOTH_SIDES" lock="0" dropcapstyle="None" pageBreak="CELL" repeatHeader="1" rowCnt="{row_cnt}" colCnt="{col_cnt}" cellSpacing="0" borderFillIDRef="{self.table_border_fill_id}" noAdjust="0">')
         
-        # Dimensions — shrink table width so it fits inside the indented column
+        # Dimensions
         xml_parts.append(f'<hp:sz width="{effective_width}" widthRelTo="ABSOLUTE" height="{row_cnt * 1000}" heightRelTo="ABSOLUTE" protect="0"/>')
-        xml_parts.append(f'<hp:pos treatAsChar="0" affectLSpacing="0" flowWithText="1" allowOverlap="0" holdAnchorAndSO="0" vertRelTo="PARA" horzRelTo="COLUMN" vertAlign="TOP" horzAlign="LEFT" vertOffset="0" horzOffset="{horz_offset}"/>')
+        xml_parts.append('<hp:pos treatAsChar="0" affectLSpacing="0" flowWithText="1" allowOverlap="0" holdAnchorAndSO="0" vertRelTo="PARA" horzRelTo="COLUMN" vertAlign="TOP" horzAlign="LEFT" vertOffset="0" horzOffset="0"/>')
         xml_parts.append('<hp:outMargin left="0" right="0" top="0" bottom="1417"/>')
         xml_parts.append('<hp:inMargin left="510" right="510" top="141" bottom="141"/>')
         
@@ -905,11 +910,14 @@ class PandocToHwpx:
         """Ensure a borderFill for tables exists in header.xml"""
         if self.table_border_fill_id is not None:
             return self.table_border_fill_id
-        
+
         # Create new borderFill ID
         self.max_border_fill_id += 1
         self.table_border_fill_id = self.max_border_fill_id
-        
+
+        if self.header_root is None:
+            return self.table_border_fill_id
+
         # Create borderFill element
         border_fill_xml = f'''<hh:borderFill xmlns:hh="http://www.hancom.co.kr/hwpml/2011/head" xmlns:hc="http://www.hancom.co.kr/hwpml/2011/core" id="{self.table_border_fill_id}" threeD="0" shadow="0" slash="NONE" backSlash="NONE" crookedSlash="0" counterstrike="0">
     <hh:leftBorder type="SOLID" width="0.12 mm" color="#000000"/>
@@ -1140,6 +1148,16 @@ class PandocToHwpx:
                     elif block_type == 'OrderedList':
                         result.append(self._handle_ordered_list(content, depth + 1))
 
+                    elif block_type == 'Header':
+                        # Headers can appear as direct children of list items
+                        result.append(self._handle_header(content))
+
+                    elif block_type == 'HorizontalRule':
+                        result.append(self._handle_horizontal_rule())
+
+                    elif block_type == 'BlockQuote':
+                        result.append(self._handle_block_quote(content, para_pr_id=para_pr_id))
+
                     elif block_type == 'Table':
                         table_xml = self._handle_table(content, para_pr_id=para_pr_id)
                         if table_xml:
@@ -1191,6 +1209,15 @@ class PandocToHwpx:
                     elif block_type == 'OrderedList':
                         result.append(self._handle_ordered_list(content, depth + 1))
 
+                    elif block_type == 'Header':
+                        result.append(self._handle_header(content))
+
+                    elif block_type == 'HorizontalRule':
+                        result.append(self._handle_horizontal_rule())
+
+                    elif block_type == 'BlockQuote':
+                        result.append(self._handle_block_quote(content, para_pr_id=para_pr_id))
+
                     elif block_type == 'Table':
                         # Table directly inside a list item
                         table_xml = self._handle_table(content, para_pr_id=para_pr_id)
@@ -1212,8 +1239,6 @@ class PandocToHwpx:
                         result.append(self._handle_code_block(content))
 
         return "\n".join(result)
-
-    def _process_blocks_in_list(self, blocks, depth=0):
         """Process blocks that appear inside a list item (e.g. inside a Div).
         Recursively handles nested lists and tables at any depth.
         Para/Plain blocks are rendered with depth-appropriate indentation."""
@@ -1240,6 +1265,10 @@ class PandocToHwpx:
                 result.append(xml)
             elif block_type == 'Header':
                 result.append(self._handle_header(content))
+            elif block_type == 'HorizontalRule':
+                result.append(self._handle_horizontal_rule())
+            elif block_type == 'BlockQuote':
+                result.append(self._handle_block_quote(content, para_pr_id=para_pr_id))
             elif block_type == 'Table':
                 table_xml = self._handle_table(content, para_pr_id=para_pr_id)
                 if table_xml:
@@ -1255,6 +1284,8 @@ class PandocToHwpx:
                 raw_xml = self._handle_raw_block_in_list(content, para_pr_id=para_pr_id)
                 if raw_xml:
                     result.append(raw_xml)
+            elif block_type == 'CodeBlock':
+                result.append(self._handle_code_block(content))
         return "\n".join(result)
 
     def _handle_raw_block_in_list(self, content, para_pr_id=None):
@@ -1412,8 +1443,10 @@ class PandocToHwpx:
         if self.table_border_fill_id is None:
             self._ensure_table_border_fill()
 
-        horz_offset = self._get_left_margin_from_para_pr(effective_para_pr_id)
-        effective_width = TOTAL_TABLE_WIDTH - horz_offset
+        # paraPr left-margin already handles the list indent — horzOffset stays 0.
+        # Shrink width so the table doesn't overflow the right page margin.
+        para_left_margin = self._get_left_margin_from_para_pr(effective_para_pr_id)
+        effective_width = TOTAL_TABLE_WIDTH - para_left_margin
         # Column widths are based on the effective (post-indent) table width
         col_widths = [int(effective_width / col_cnt) for _ in range(col_cnt)]
 
@@ -1429,10 +1462,10 @@ class PandocToHwpx:
             f'height="{row_cnt * 1000}" heightRelTo="ABSOLUTE" protect="0"/>'
         )
         xml_parts.append(
-            f'<hp:pos treatAsChar="0" affectLSpacing="0" flowWithText="1" '
-            f'allowOverlap="0" holdAnchorAndSO="0" vertRelTo="PARA" '
-            f'horzRelTo="COLUMN" vertAlign="TOP" horzAlign="LEFT" '
-            f'vertOffset="0" horzOffset="{horz_offset}"/>'
+            '<hp:pos treatAsChar="0" affectLSpacing="0" flowWithText="1" '
+            'allowOverlap="0" holdAnchorAndSO="0" vertRelTo="PARA" '
+            'horzRelTo="COLUMN" vertAlign="TOP" horzAlign="LEFT" '
+            'vertOffset="0" horzOffset="0"/>'
         )
         xml_parts.append('<hp:outMargin left="0" right="0" top="0" bottom="1417"/>')
         xml_parts.append('<hp:inMargin left="510" right="510" top="141" bottom="141"/>')
@@ -1503,6 +1536,198 @@ class PandocToHwpx:
         xml += '</hp:p>'
         return xml
 
+    def _handle_horizontal_rule(self):
+        """Render a <hr> as an empty paragraph with a bottom border in header.xml.
+
+        We create a dedicated paraPr (cached) that has a solid bottom border,
+        which visually mimics a horizontal rule in HWP.
+        """
+        cache_key = '__horizontal_rule__'
+        if cache_key in self.para_pr_cache:
+            hr_para_pr_id = self.para_pr_cache[cache_key]
+        else:
+            hr_para_pr_id = self._create_hr_para_pr()
+            self.para_pr_cache[cache_key] = hr_para_pr_id
+
+        xml = self._create_para_start(style_id=self.normal_style_id, para_pr_id=hr_para_pr_id)
+        xml += '<hp:run charPrIDRef="0"><hp:t></hp:t></hp:run>'
+        xml += '</hp:p>'
+        return xml
+
+    def _create_hr_para_pr(self):
+        """Create a paraPr whose border-fill shows a solid bottom line (HR effect)."""
+        if self.header_root is None:
+            return str(self.normal_para_pr_id)
+
+        # First ensure a border-fill entry exists for the HR line
+        hr_bf_id = self._ensure_hr_border_fill()
+
+        base_node = self.header_root.find(
+            f'.//hh:paraPr[@id="{self.normal_para_pr_id}"]', self.namespaces)
+        if base_node is None:
+            base_node = self.header_root.find('.//hh:paraPr[@id="0"]', self.namespaces)
+        if base_node is None:
+            return str(self.normal_para_pr_id)
+
+        new_node = copy.deepcopy(base_node)
+        self.max_para_pr_id += 1
+        new_id = str(self.max_para_pr_id)
+        new_node.set('id', new_id)
+
+        HH = 'http://www.hancom.co.kr/hwpml/2011/head'
+        # Set borderFillIDRef on the paraPr itself
+        new_node.set('borderFillIDRef', str(hr_bf_id))
+
+        para_props = self.header_root.find('.//hh:paraProperties', self.namespaces)
+        if para_props is not None:
+            para_props.append(new_node)
+
+        return new_id
+
+    def _ensure_hr_border_fill(self):
+        """Create/return a borderFill that has only a solid bottom border (HR line)."""
+        if hasattr(self, '_hr_border_fill_id') and self._hr_border_fill_id is not None:
+            return self._hr_border_fill_id
+
+        self.max_border_fill_id += 1
+        bf_id = self.max_border_fill_id
+        self._hr_border_fill_id = bf_id
+
+        border_fill_xml = (
+            f'<hh:borderFill xmlns:hh="http://www.hancom.co.kr/hwpml/2011/head" '
+            f'xmlns:hc="http://www.hancom.co.kr/hwpml/2011/core" '
+            f'id="{bf_id}" threeD="0" shadow="0" slash="NONE" backSlash="NONE" '
+            f'crookedSlash="0" counterstrike="0">'
+            f'<hh:leftBorder type="NONE" width="0.12 mm" color="#000000"/>'
+            f'<hh:rightBorder type="NONE" width="0.12 mm" color="#000000"/>'
+            f'<hh:topBorder type="NONE" width="0.12 mm" color="#000000"/>'
+            f'<hh:bottomBorder type="SOLID" width="0.12 mm" color="#A0A0A0"/>'
+            f'<hh:diagonal type="NONE" crooked="0"/>'
+            f'<hc:fill><hc:fillColorPattern type="NONE" foreColor="#FFFFFF" backColor="#FFFFFF"/></hc:fill>'
+            f'</hh:borderFill>'
+        )
+        bf_elem = ET.fromstring(border_fill_xml)
+        bf_container = self.header_root.find('.//hh:borderFills', self.namespaces)
+        if bf_container is None:
+            bf_container = ET.SubElement(
+                self.header_root, '{http://www.hancom.co.kr/hwpml/2011/head}borderFills')
+        bf_container.append(bf_elem)
+        return bf_id
+
+    def _handle_block_quote(self, content, para_pr_id=None):
+        """Render a BlockQuote as indented paragraphs.
+
+        content is a list of blocks (same structure as a list item).
+        para_pr_id: when called from inside a list, the caller's depth paraPr
+                    is passed so indentation stacks correctly.
+        """
+        # BlockQuote gets one extra indent level beyond any surrounding list
+        # Use a fixed left-margin of 3600 HWPUNIT relative to whatever para_pr_id
+        # the caller is already using.
+        BQ_EXTRA_INDENT = 3600  # ~1.27 cm
+
+        if para_pr_id is not None:
+            base_margin = self._get_left_margin_from_para_pr(para_pr_id)
+        else:
+            base_margin = 0
+
+        bq_left_margin = base_margin + BQ_EXTRA_INDENT
+
+        # Get/create a paraPr for this exact left-margin
+        cache_key = (bq_left_margin, 0)
+        if cache_key in self.para_pr_cache:
+            bq_para_pr_id = self.para_pr_cache[cache_key]
+        else:
+            # Reuse _get_para_pr_for_list_depth logic but with an explicit margin
+            bq_para_pr_id = self._create_para_pr_with_margin(bq_left_margin)
+            self.para_pr_cache[cache_key] = bq_para_pr_id
+
+        result = []
+        for block in (content or []):
+            if not isinstance(block, dict):
+                continue
+            bt = block.get('t')
+            bc = block.get('c')
+            if bt in ('Para', 'Plain'):
+                xml = self._create_para_start(
+                    style_id=self.normal_style_id, para_pr_id=bq_para_pr_id)
+                xml += self._process_inlines(bc)
+                xml += '</hp:p>'
+                result.append(xml)
+            elif bt == 'Header':
+                result.append(self._handle_header(bc))
+            elif bt == 'BulletList':
+                result.append(self._handle_bullet_list(bc))
+            elif bt == 'OrderedList':
+                result.append(self._handle_ordered_list(bc))
+            elif bt == 'Table':
+                result.append(self._handle_table(bc, para_pr_id=bq_para_pr_id))
+            elif bt == 'HorizontalRule':
+                result.append(self._handle_horizontal_rule())
+            elif bt == 'BlockQuote':
+                result.append(self._handle_block_quote(bc, para_pr_id=bq_para_pr_id))
+            elif bt == 'CodeBlock':
+                result.append(self._handle_code_block(bc))
+        return "\n".join(result)
+
+    def _create_para_pr_with_margin(self, left_margin_hwpunit):
+        """Create a new paraPr with the given left margin in HWPUNIT. Returns the new id string."""
+        if self.header_root is None:
+            return str(self.normal_para_pr_id)
+
+        base_node = self.header_root.find(
+            f'.//hh:paraPr[@id="{self.normal_para_pr_id}"]', self.namespaces)
+        if base_node is None:
+            base_node = self.header_root.find('.//hh:paraPr[@id="0"]', self.namespaces)
+        if base_node is None:
+            return str(self.normal_para_pr_id)
+
+        new_node = copy.deepcopy(base_node)
+        self.max_para_pr_id += 1
+        new_id = str(self.max_para_pr_id)
+        new_node.set('id', new_id)
+
+        HP = 'http://www.hancom.co.kr/hwpml/2011/paragraph'
+        HH = 'http://www.hancom.co.kr/hwpml/2011/head'
+        HC = 'http://www.hancom.co.kr/hwpml/2011/core'
+
+        def _set_margin(parent_elem):
+            margin = parent_elem.find('hh:margin', self.namespaces)
+            if margin is None:
+                margin = ET.SubElement(parent_elem, f'{{{HH}}}margin')
+            left = margin.find('hc:left', self.namespaces)
+            if left is None:
+                left = ET.SubElement(margin, f'{{{HC}}}left')
+            left.set('value', str(left_margin_hwpunit))
+            left.set('unit', 'HWPUNIT')
+            indent = margin.find('hc:intent', self.namespaces)
+            if indent is None:
+                indent = ET.SubElement(margin, f'{{{HC}}}intent')
+            indent.set('value', '0')
+            indent.set('unit', 'HWPUNIT')
+
+        switch_elem = new_node.find('hp:switch', self.namespaces)
+        if switch_elem is None:
+            switch_elem = ET.SubElement(new_node, f'{{{HP}}}switch')
+
+        default_elem = switch_elem.find('hp:default', self.namespaces)
+        if default_elem is None:
+            default_elem = ET.SubElement(switch_elem, f'{{{HP}}}default')
+        _set_margin(default_elem)
+
+        case_elem = switch_elem.find('hp:case', self.namespaces)
+        if case_elem is None:
+            case_elem = ET.SubElement(switch_elem, f'{{{HP}}}case')
+            case_elem.set(f'{{{HP}}}required-namespace',
+                          'http://www.hancom.co.kr/hwpml/2016/HwpUnitChar')
+        _set_margin(case_elem)
+
+        para_props = self.header_root.find('.//hh:paraProperties', self.namespaces)
+        if para_props is not None:
+            para_props.append(new_node)
+
+        return new_id
+
     def _process_blocks(self, blocks):
         """Process Pandoc block elements"""
         result = []
@@ -1540,6 +1765,12 @@ class PandocToHwpx:
 
             elif block_type == 'CodeBlock':
                 result.append(self._handle_code_block(content))
+
+            elif block_type == 'HorizontalRule':
+                result.append(self._handle_horizontal_rule())
+
+            elif block_type == 'BlockQuote':
+                result.append(self._handle_block_quote(content))
 
             elif block_type == 'RawBlock':
                 raw_xml = self._handle_raw_block_in_list(content)
