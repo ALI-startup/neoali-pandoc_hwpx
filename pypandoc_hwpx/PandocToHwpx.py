@@ -590,6 +590,127 @@ class PandocToHwpx:
         self.para_pr_cache[cache_key] = new_id
         return new_id
 
+    # HWPUNIT per list depth level (1 HWPUNIT ≈ 1/7200 inch; 3600 ≈ 0.5 inch / ~1.27 cm)
+    LIST_INDENT_HWPUNIT = 3600
+
+    def _get_para_pr_for_list_depth(self, depth):
+        """Return a paraPrIDRef that adds left-margin indentation matching *depth* list levels.
+
+        depth=0 → top-level list  (1 level of indent)
+        depth=1 → nested list     (2 levels of indent)
+        …and so on.
+
+        The indentation is stored directly in HWPUNIT so we bypass the pt→HWPUNIT
+        conversion in _get_or_create_para_pr and call the internal cache directly.
+        """
+        left_margin = (depth + 1) * self.LIST_INDENT_HWPUNIT
+
+        cache_key = (left_margin, 0)  # no text-indent for list paragraphs
+        if cache_key in self.para_pr_cache:
+            return self.para_pr_cache[cache_key]
+
+        if self.header_root is None:
+            return str(self.normal_para_pr_id)
+
+        # Clone the base paraPr
+        base_node = self.header_root.find(
+            f'.//hh:paraPr[@id="{self.normal_para_pr_id}"]', self.namespaces
+        )
+        if base_node is None:
+            base_node = self.header_root.find('.//hh:paraPr[@id="0"]', self.namespaces)
+        if base_node is None:
+            return str(self.normal_para_pr_id)
+
+        new_node = copy.deepcopy(base_node)
+        self.max_para_pr_id += 1
+        new_id = str(self.max_para_pr_id)
+        new_node.set('id', new_id)
+
+        HP = 'http://www.hancom.co.kr/hwpml/2011/paragraph'
+        HH = 'http://www.hancom.co.kr/hwpml/2011/head'
+        HC = 'http://www.hancom.co.kr/hwpml/2011/core'
+
+        def _set_margin(parent_elem):
+            margin = parent_elem.find('hh:margin', self.namespaces)
+            if margin is None:
+                margin = ET.SubElement(parent_elem, f'{{{HH}}}margin')
+            left = margin.find('hc:left', self.namespaces)
+            if left is None:
+                left = ET.SubElement(margin, f'{{{HC}}}left')
+            left.set('value', str(left_margin))
+            left.set('unit', 'HWPUNIT')
+            # Keep text-indent at 0
+            indent = margin.find('hc:intent', self.namespaces)
+            if indent is None:
+                indent = ET.SubElement(margin, f'{{{HC}}}intent')
+            indent.set('value', '0')
+            indent.set('unit', 'HWPUNIT')
+
+        # Apply to both <hp:switch><hp:default> and <hp:switch><hp:case> sub-trees
+        switch_elem = new_node.find('hp:switch', self.namespaces)
+        if switch_elem is None:
+            switch_elem = ET.SubElement(new_node, f'{{{HP}}}switch')
+
+        default_elem = switch_elem.find('hp:default', self.namespaces)
+        if default_elem is None:
+            default_elem = ET.SubElement(switch_elem, f'{{{HP}}}default')
+        _set_margin(default_elem)
+
+        case_elem = switch_elem.find('hp:case', self.namespaces)
+        if case_elem is None:
+            case_elem = ET.SubElement(switch_elem, f'{{{HP}}}case')
+            case_elem.set(
+                f'{{{HP}}}required-namespace',
+                'http://www.hancom.co.kr/hwpml/2016/HwpUnitChar'
+            )
+        _set_margin(case_elem)
+
+        # Also set the top-level <hh:margin> if the paraPr has one directly
+        direct_margin = new_node.find('hh:margin', self.namespaces)
+        if direct_margin is not None:
+            _set_margin(new_node)
+
+        # Register in header
+        para_props = self.header_root.find('.//hh:paraProperties', self.namespaces)
+        if para_props is not None:
+            para_props.append(new_node)
+
+        self.para_pr_cache[cache_key] = new_id
+        return new_id
+
+    def _get_left_margin_from_para_pr(self, para_pr_id):
+        """Return the left-margin value (in HWPUNIT) stored in the given paraPr node.
+
+        Used so that tables placed inside list items can set an identical
+        horzOffset, making them visually align with the surrounding text.
+        Falls back to 0 if the paraPr or its margin element cannot be found.
+        """
+        # Fast path: check para_pr_cache in reverse to find matching left_margin
+        for (left_margin, _indent), pid in self.para_pr_cache.items():
+            if pid == str(para_pr_id):
+                return left_margin
+
+        # Slow path: read directly from header XML
+        if self.header_root is None:
+            return 0
+        node = self.header_root.find(f'.//hh:paraPr[@id="{para_pr_id}"]', self.namespaces)
+        if node is None:
+            return 0
+
+        # Look inside switch/default/margin/left  or switch/case/margin/left
+        for container_path in (
+            'hp:switch/hp:default/hh:margin/hc:left',
+            'hp:switch/hp:case/hh:margin/hc:left',
+            'hh:margin/hc:left',
+        ):
+            elem = node.find(container_path, self.namespaces)
+            if elem is not None:
+                try:
+                    return int(elem.get('value', 0))
+                except (TypeError, ValueError):
+                    pass
+        return 0
+
     def _escape_text(self, text):
         return saxutils.escape(text)
 
@@ -606,8 +727,14 @@ class PandocToHwpx:
         run_xml += '</hp:run>'
         return run_xml
 
-    def _handle_table(self, content):
-        """Handle table from Pandoc AST with proper spanning cell support"""
+    def _handle_table(self, content, para_pr_id=None):
+        """Handle table from Pandoc AST with proper spanning cell support.
+
+        para_pr_id: optional paraPrIDRef to use for the wrapping paragraph.
+                    When supplied (e.g. from inside a list), the table is
+                    indented to match the list level via both paraPr left-margin
+                    and the table's horzOffset attribute.
+        """
         specs = content[2]
         table_head = content[3]
         table_bodies = content[4] 
@@ -675,31 +802,38 @@ class PandocToHwpx:
         row_cnt = max_row + 1
         col_cnt = max_col + 1
         
-        # 3. Calculate Widths
+        # 3. Calculate Widths — deferred until we know the indent offset
         TOTAL_TABLE_WIDTH = 45000
-        col_widths = [int(TOTAL_TABLE_WIDTH / col_cnt) for _ in range(col_cnt)]
             
         # 4. Generate Table XML
         import time
         import random
         tbl_id = str(int(time.time() * 1000) % 100000000 + random.randint(0, 10000))
-        
+
         xml_parts = []
-        
-        # Para Start
-        xml_parts.append(self._create_para_start(style_id=self.normal_style_id, para_pr_id=self.normal_para_pr_id))
+
+        # Para Start — use caller-supplied para_pr_id (e.g. from list context) or default
+        effective_para_pr_id = para_pr_id if para_pr_id is not None else self.normal_para_pr_id
+        xml_parts.append(self._create_para_start(style_id=self.normal_style_id, para_pr_id=effective_para_pr_id))
         xml_parts.append(self._create_run_start(char_pr_id=0))
         
         # Ensure table borderFill exists
         if self.table_border_fill_id is None:
             self._ensure_table_border_fill()
+
+        # Derive horizontal offset from the paraPr's left-margin so the table
+        # visually aligns with the surrounding list text.
+        horz_offset = self._get_left_margin_from_para_pr(effective_para_pr_id)
+        # Shrink table so it stays within the page column after the indent
+        effective_width = TOTAL_TABLE_WIDTH - horz_offset
+        col_widths = [int(effective_width / col_cnt) for _ in range(col_cnt)]
         
         # Table properties
         xml_parts.append(f'<hp:tbl id="{tbl_id}" zOrder="0" numberingType="TABLE" textWrap="TOP_AND_BOTTOM" textFlow="BOTH_SIDES" lock="0" dropcapstyle="None" pageBreak="CELL" repeatHeader="1" rowCnt="{row_cnt}" colCnt="{col_cnt}" cellSpacing="0" borderFillIDRef="{self.table_border_fill_id}" noAdjust="0">')
         
-        # Dimensions
-        xml_parts.append(f'<hp:sz width="{TOTAL_TABLE_WIDTH}" widthRelTo="ABSOLUTE" height="{row_cnt * 1000}" heightRelTo="ABSOLUTE" protect="0"/>')
-        xml_parts.append('<hp:pos treatAsChar="0" affectLSpacing="0" flowWithText="1" allowOverlap="0" holdAnchorAndSO="0" vertRelTo="PARA" horzRelTo="COLUMN" vertAlign="TOP" horzAlign="LEFT" vertOffset="0" horzOffset="0"/>')
+        # Dimensions — shrink table width so it fits inside the indented column
+        xml_parts.append(f'<hp:sz width="{effective_width}" widthRelTo="ABSOLUTE" height="{row_cnt * 1000}" heightRelTo="ABSOLUTE" protect="0"/>')
+        xml_parts.append(f'<hp:pos treatAsChar="0" affectLSpacing="0" flowWithText="1" allowOverlap="0" holdAnchorAndSO="0" vertRelTo="PARA" horzRelTo="COLUMN" vertAlign="TOP" horzAlign="LEFT" vertOffset="0" horzOffset="{horz_offset}"/>')
         xml_parts.append('<hp:outMargin left="0" right="0" top="0" bottom="1417"/>')
         xml_parts.append('<hp:inMargin left="510" right="510" top="141" bottom="141"/>')
         
@@ -975,55 +1109,399 @@ class PandocToHwpx:
         xml += '</hp:p>'
         return xml
 
-    def _handle_bullet_list(self, list_data):
-        """Handle bullet lists with proper formatting"""
+    def _handle_bullet_list(self, list_data, depth=0):
+        """Handle bullet lists with proper formatting, including tables inside list items"""
         items = list_data if isinstance(list_data, list) else []
         result = []
-        
+
+        # Resolve indented paraPr for this depth level once
+        para_pr_id = self._get_para_pr_for_list_depth(depth)
+
         for item in items:
             if isinstance(item, list):
+                # Track whether this item had a text block (Plain/Para) before the table
+                has_text_block = False
                 for block in item:
                     block_type = block.get('t')
                     content = block.get('c')
-                    
+
                     if block_type == 'Plain' or block_type == 'Para':
-                        result.append(self._create_para_start())
-                        result.append('<hp:run charPrIDRef="0"><hp:t>• </hp:t></hp:run>')
+                        result.append(self._create_para_start(
+                            style_id=self.normal_style_id, para_pr_id=para_pr_id))
+                        if not has_text_block:
+                            result.append('<hp:run charPrIDRef="0"><hp:t>• </hp:t></hp:run>')
+                            has_text_block = True
                         result.append(self._process_inlines(content))
                         result.append('</hp:p>')
+
                     elif block_type == 'BulletList':
-                        # Nested bullet list
-                        result.append(self._handle_bullet_list(content))
+                        result.append(self._handle_bullet_list(content, depth + 1))
+
                     elif block_type == 'OrderedList':
-                        # Nested ordered list
-                        result.append(self._handle_ordered_list(content))
+                        result.append(self._handle_ordered_list(content, depth + 1))
+
+                    elif block_type == 'Table':
+                        table_xml = self._handle_table(content, para_pr_id=para_pr_id)
+                        if table_xml:
+                            result.append(table_xml)
+
+                    elif block_type == 'Div':
+                        div_blocks = content[1] if (content and len(content) > 1) else []
+                        result.append(self._process_blocks_in_list(div_blocks, depth))
+
+                    elif block_type == 'RawBlock':
+                        raw_xml = self._handle_raw_block_in_list(content, para_pr_id=para_pr_id)
+                        if raw_xml:
+                            result.append(raw_xml)
+
+                    elif block_type == 'CodeBlock':
+                        result.append(self._handle_code_block(content))
+
         return "\n".join(result)
 
-    def _handle_ordered_list(self, list_data):
-        """Handle ordered lists with proper formatting"""
+    def _handle_ordered_list(self, list_data, depth=0):
+        """Handle ordered lists with proper formatting, including tables inside list items"""
         # list_data = [list_attributes, items]
         items = list_data[1] if len(list_data) > 1 else []
         result = []
-        
+
+        # Resolve indented paraPr for this depth level once
+        para_pr_id = self._get_para_pr_for_list_depth(depth)
+
         for idx, item in enumerate(items, 1):
             # Each item is a list of blocks
             if isinstance(item, list):
+                has_text_block = False
                 for block in item:
                     block_type = block.get('t')
                     content = block.get('c')
-                    
+
                     if block_type == 'Plain' or block_type == 'Para':
-                        result.append(self._create_para_start())
-                        result.append(f'<hp:run charPrIDRef="0"><hp:t>{idx}. </hp:t></hp:run>')
+                        result.append(self._create_para_start(
+                            style_id=self.normal_style_id, para_pr_id=para_pr_id))
+                        if not has_text_block:
+                            result.append(f'<hp:run charPrIDRef="0"><hp:t>{idx}. </hp:t></hp:run>')
+                            has_text_block = True
                         result.append(self._process_inlines(content))
                         result.append('</hp:p>')
+
                     elif block_type == 'BulletList':
-                        # Nested bullet list
-                        result.append(self._handle_bullet_list(content))
+                        result.append(self._handle_bullet_list(content, depth + 1))
+
                     elif block_type == 'OrderedList':
-                        # Nested ordered list
-                        result.append(self._handle_ordered_list(content))
+                        result.append(self._handle_ordered_list(content, depth + 1))
+
+                    elif block_type == 'Table':
+                        # Table directly inside a list item
+                        table_xml = self._handle_table(content, para_pr_id=para_pr_id)
+                        if table_xml:
+                            result.append(table_xml)
+
+                    elif block_type == 'Div':
+                        # Div may wrap a table or other blocks inside a list item
+                        div_blocks = content[1] if (content and len(content) > 1) else []
+                        result.append(self._process_blocks_in_list(div_blocks, depth))
+
+                    elif block_type == 'RawBlock':
+                        # Pandoc sometimes emits tables inside lists as raw HTML
+                        raw_xml = self._handle_raw_block_in_list(content, para_pr_id=para_pr_id)
+                        if raw_xml:
+                            result.append(raw_xml)
+
+                    elif block_type == 'CodeBlock':
+                        result.append(self._handle_code_block(content))
+
         return "\n".join(result)
+
+    def _process_blocks_in_list(self, blocks, depth=0):
+        """Process blocks that appear inside a list item (e.g. inside a Div).
+        Recursively handles nested lists and tables at any depth.
+        Para/Plain blocks are rendered with depth-appropriate indentation."""
+        result = []
+        para_pr_id = self._get_para_pr_for_list_depth(depth)
+
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+            block_type = block.get('t')
+            content = block.get('c')
+
+            if block_type == 'Para':
+                xml = self._create_para_start(
+                    style_id=self.normal_style_id, para_pr_id=para_pr_id)
+                xml += self._process_inlines(content)
+                xml += '</hp:p>'
+                result.append(xml)
+            elif block_type == 'Plain':
+                xml = self._create_para_start(
+                    style_id=self.normal_style_id, para_pr_id=para_pr_id)
+                xml += self._process_inlines(content)
+                xml += '</hp:p>'
+                result.append(xml)
+            elif block_type == 'Header':
+                result.append(self._handle_header(content))
+            elif block_type == 'Table':
+                table_xml = self._handle_table(content, para_pr_id=para_pr_id)
+                if table_xml:
+                    result.append(table_xml)
+            elif block_type == 'BulletList':
+                result.append(self._handle_bullet_list(content, depth + 1))
+            elif block_type == 'OrderedList':
+                result.append(self._handle_ordered_list(content, depth + 1))
+            elif block_type == 'Div':
+                inner_blocks = content[1] if (content and len(content) > 1) else []
+                result.append(self._process_blocks_in_list(inner_blocks, depth))
+            elif block_type == 'RawBlock':
+                raw_xml = self._handle_raw_block_in_list(content, para_pr_id=para_pr_id)
+                if raw_xml:
+                    result.append(raw_xml)
+        return "\n".join(result)
+
+    def _handle_raw_block_in_list(self, content, para_pr_id=None):
+        """Handle RawBlock nodes that may contain HTML tables inside list items.
+
+        Pandoc sometimes cannot fully parse a table that is nested inside a list
+        and instead emits it as a RawBlock with format 'html'.  We detect that
+        case here, build a minimal Pandoc-style AST for the table using
+        html.parser, and delegate to the regular _handle_table path so the
+        output is identical to a natively parsed table.
+        """
+        if not content or len(content) < 2:
+            return ""
+
+        raw_format = content[0]
+        raw_html = content[1]
+
+        # Only attempt to handle HTML blocks that look like tables
+        if raw_format not in ('html', 'HTML'):
+            return ""
+        if '<table' not in raw_html.lower():
+            return ""
+
+        try:
+            return self._convert_raw_html_table(raw_html, para_pr_id=para_pr_id)
+        except Exception as e:
+            print(f"[Warn] Failed to convert raw HTML table: {e}", file=sys.stderr)
+            return ""
+
+    def _convert_raw_html_table(self, html_str, para_pr_id=None):
+        """Parse a raw HTML <table> string and convert it to HWPX XML.
+
+        Builds a minimal cell-grid directly from the HTML so that we can reuse
+        the existing _handle_table infrastructure (column-width calculation,
+        borderFill, subList generation, etc.) without duplicating logic.
+        para_pr_id: when set, applies the same indentation as the surrounding list.
+        """
+        from html.parser import HTMLParser as _HP
+
+        class _TableParser(_HP):
+            """Minimal SAX-style parser that extracts rows/cells from an HTML table."""
+            def __init__(self):
+                super().__init__()
+                self.rows = []          # list of rows; each row = list of cell dicts
+                self._cur_row = None
+                self._cur_cell = None   # {'is_header': bool, 'colspan': int, 'rowspan': int, 'text': str}
+                self._in_cell = False
+                self._text_buf = []
+                self._depth = 0         # nesting guard for nested tables
+
+            def handle_starttag(self, tag, attrs):
+                attrs_d = dict(attrs)
+                if tag == 'table':
+                    self._depth += 1
+                    return
+                if self._depth != 1:   # ignore nested tables
+                    return
+                if tag == 'tr':
+                    self._cur_row = []
+                elif tag in ('td', 'th'):
+                    self._in_cell = True
+                    self._text_buf = []
+                    self._cur_cell = {
+                        'is_header': tag == 'th',
+                        'colspan': int(attrs_d.get('colspan', 1)),
+                        'rowspan': int(attrs_d.get('rowspan', 1)),
+                        'text': ''
+                    }
+
+            def handle_endtag(self, tag):
+                if tag == 'table':
+                    self._depth -= 1
+                    return
+                if self._depth != 1:
+                    return
+                if tag in ('td', 'th'):
+                    if self._cur_cell is not None:
+                        self._cur_cell['text'] = ''.join(self._text_buf).strip()
+                        if self._cur_row is not None:
+                            self._cur_row.append(self._cur_cell)
+                    self._cur_cell = None
+                    self._in_cell = False
+                    self._text_buf = []
+                elif tag == 'tr':
+                    if self._cur_row is not None:
+                        self.rows.append(self._cur_row)
+                    self._cur_row = None
+
+            def handle_data(self, data):
+                if self._in_cell and self._depth == 1:
+                    self._text_buf.append(data)
+
+        parser = _TableParser()
+        parser.feed(html_str)
+        rows = parser.rows
+
+        if not rows:
+            return ""
+
+        # ---- Build the same cell_grid that _handle_table produces ----
+        cell_grid = {}
+        max_row = 0
+        max_col = 0
+
+        for row_idx, row in enumerate(rows):
+            curr_col = 0
+            for cell in row:
+                # skip occupied cells
+                while (row_idx, curr_col) in cell_grid:
+                    curr_col += 1
+
+                colspan = cell['colspan']
+                rowspan = cell['rowspan']
+                text = cell['text']
+
+                # Build a minimal Pandoc block list for the cell content
+                # so we can reuse _process_blocks_for_table_cell
+                if text:
+                    inline_block = {
+                        't': 'Para',
+                        'c': [{'t': 'Str', 'c': text}]
+                    }
+                else:
+                    inline_block = {'t': 'Para', 'c': []}
+
+                for r in range(rowspan):
+                    for c in range(colspan):
+                        cell_grid[(row_idx + r, curr_col + c)] = {
+                            'origin_row': row_idx,
+                            'origin_col': curr_col,
+                            'rowspan': rowspan,
+                            'colspan': colspan,
+                            'blocks': [inline_block]
+                        }
+
+                max_row = max(max_row, row_idx + rowspan - 1)
+                max_col = max(max_col, curr_col + colspan - 1)
+                curr_col += colspan
+
+        row_cnt = max_row + 1
+        col_cnt = max_col + 1
+
+        # ---- Re-use the XML-generation portion of _handle_table ----
+        TOTAL_TABLE_WIDTH = 45000
+
+        import time, random
+        tbl_id = str(int(time.time() * 1000) % 100000000 + random.randint(0, 10000))
+
+        xml_parts = []
+        effective_para_pr_id = para_pr_id if para_pr_id is not None else self.normal_para_pr_id
+        xml_parts.append(self._create_para_start(style_id=self.normal_style_id,
+                                                  para_pr_id=effective_para_pr_id))
+        xml_parts.append(self._create_run_start(char_pr_id=0))
+
+        if self.table_border_fill_id is None:
+            self._ensure_table_border_fill()
+
+        horz_offset = self._get_left_margin_from_para_pr(effective_para_pr_id)
+        effective_width = TOTAL_TABLE_WIDTH - horz_offset
+        # Column widths are based on the effective (post-indent) table width
+        col_widths = [int(effective_width / col_cnt) for _ in range(col_cnt)]
+
+        xml_parts.append(
+            f'<hp:tbl id="{tbl_id}" zOrder="0" numberingType="TABLE" '
+            f'textWrap="TOP_AND_BOTTOM" textFlow="BOTH_SIDES" lock="0" '
+            f'dropcapstyle="None" pageBreak="CELL" repeatHeader="1" '
+            f'rowCnt="{row_cnt}" colCnt="{col_cnt}" cellSpacing="0" '
+            f'borderFillIDRef="{self.table_border_fill_id}" noAdjust="0">'
+        )
+        xml_parts.append(
+            f'<hp:sz width="{effective_width}" widthRelTo="ABSOLUTE" '
+            f'height="{row_cnt * 1000}" heightRelTo="ABSOLUTE" protect="0"/>'
+        )
+        xml_parts.append(
+            f'<hp:pos treatAsChar="0" affectLSpacing="0" flowWithText="1" '
+            f'allowOverlap="0" holdAnchorAndSO="0" vertRelTo="PARA" '
+            f'horzRelTo="COLUMN" vertAlign="TOP" horzAlign="LEFT" '
+            f'vertOffset="0" horzOffset="{horz_offset}"/>'
+        )
+        xml_parts.append('<hp:outMargin left="0" right="0" top="0" bottom="1417"/>')
+        xml_parts.append('<hp:inMargin left="510" right="510" top="141" bottom="141"/>')
+
+        processed_cells = set()
+        for row_idx in range(row_cnt):
+            xml_parts.append('<hp:tr>')
+            for col_idx in range(col_cnt):
+                if (row_idx, col_idx) not in cell_grid:
+                    continue
+                cell_info = cell_grid[(row_idx, col_idx)]
+                if cell_info['origin_row'] != row_idx or cell_info['origin_col'] != col_idx:
+                    continue
+                cell_key = (row_idx, col_idx)
+                if cell_key in processed_cells:
+                    continue
+                processed_cells.add(cell_key)
+
+                rowspan = cell_info['rowspan']
+                colspan = cell_info['colspan']
+                cell_blocks = cell_info['blocks']
+                cell_width = sum(col_widths[col_idx:col_idx + colspan])
+
+                sublist_id = str(
+                    int(time.time() * 100000) % 1000000000 + random.randint(0, 100000)
+                )
+                cell_content_xml = self._process_blocks_for_table_cell(cell_blocks)
+                if not cell_content_xml.strip():
+                    cell_content_xml = (
+                        self._create_para_start(style_id=self.normal_style_id,
+                                                para_pr_id=self.normal_para_pr_id)
+                        + '<hp:run charPrIDRef="0"><hp:t></hp:t></hp:run></hp:p>'
+                    )
+
+                xml_parts.append(
+                    f'<hp:tc name="" header="0" hasMargin="0" protect="0" '
+                    f'editable="0" dirty="0" borderFillIDRef="{self.table_border_fill_id}">'
+                )
+                xml_parts.append(
+                    f'<hp:subList id="{sublist_id}" textDirection="HORIZONTAL" '
+                    f'lineWrap="BREAK" vertAlign="TOP" linkListIDRef="0" '
+                    f'linkListNextIDRef="0" textWidth="0" textHeight="0" '
+                    f'hasTextRef="0" hasNumRef="0">'
+                )
+                xml_parts.append(cell_content_xml)
+                xml_parts.append('</hp:subList>')
+                xml_parts.append(f'<hp:cellAddr colAddr="{col_idx}" rowAddr="{row_idx}"/>')
+                xml_parts.append(f'<hp:cellSpan colSpan="{colspan}" rowSpan="{rowspan}"/>')
+                xml_parts.append(f'<hp:cellSz width="{cell_width}" height="1000"/>')
+                xml_parts.append('<hp:cellMargin left="510" right="510" top="141" bottom="141"/>')
+                xml_parts.append('</hp:tc>')
+
+            xml_parts.append('</hp:tr>')
+
+        xml_parts.append('</hp:tbl>')
+        xml_parts.append('</hp:run>')
+        xml_parts.append('</hp:p>')
+
+        return "".join(xml_parts)
+
+    def _handle_code_block(self, content):
+        """Handle code blocks (fenced code) as plain paragraphs."""
+        # content = [attr, code_text]
+        code_text = content[1] if len(content) > 1 else ''
+        xml = self._create_para_start(style_id=self.normal_style_id,
+                                      para_pr_id=self.normal_para_pr_id)
+        xml += f'<hp:run charPrIDRef="0"><hp:t>{self._escape_text(code_text)}</hp:t></hp:run>'
+        xml += '</hp:p>'
+        return xml
 
     def _process_blocks(self, blocks):
         """Process Pandoc block elements"""
@@ -1031,30 +1509,43 @@ class PandocToHwpx:
         for block in blocks:
             if not isinstance(block, dict):
                 continue
-                
+
             block_type = block.get('t')
             content = block.get('c')
-            
+
             if block_type == 'Para':
                 result.append(self._handle_para(content))
-                
+
             elif block_type == 'Plain':
                 result.append(self._handle_plain(content))
-                
+
             elif block_type == 'Header':
                 result.append(self._handle_header(content))
-                
+
             elif block_type == 'BulletList':
                 result.append(self._handle_bullet_list(content))
-                
+
             elif block_type == 'OrderedList':
                 result.append(self._handle_ordered_list(content))
-                
+
             elif block_type == 'Table':
                 table_xml = self._handle_table(content)
                 if table_xml:
                     result.append(table_xml)
-                
+
+            elif block_type == 'Div':
+                # Unwrap div and process its inner blocks
+                inner_blocks = content[1] if (content and len(content) > 1) else []
+                result.append(self._process_blocks(inner_blocks))
+
+            elif block_type == 'CodeBlock':
+                result.append(self._handle_code_block(content))
+
+            elif block_type == 'RawBlock':
+                raw_xml = self._handle_raw_block_in_list(content)
+                if raw_xml:
+                    result.append(raw_xml)
+
         return "\n".join(result)
 
     def _process_inlines(self, inlines, active_formats=None, base_color=None, base_size=None):
