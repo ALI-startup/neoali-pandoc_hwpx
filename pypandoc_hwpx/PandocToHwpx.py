@@ -1929,10 +1929,16 @@ class PandocToHwpx:
     @staticmethod
     def convert_to_hwpx(input_path, output_path, reference_path):
         """Convert input file to HWPX format using reference template"""
-        # Read reference HWPX
-        with zipfile.ZipFile(reference_path, 'r') as ref_zip:
-            header_xml = ref_zip.read('Contents/header.xml').decode('utf-8')
-            section0_xml = ref_zip.read('Contents/section0.xml').decode('utf-8')
+        # Read reference HWPX (supports both a .hwpx zip file and an extracted folder)
+        if os.path.isdir(reference_path):
+            with open(os.path.join(reference_path, 'Contents', 'header.xml'), 'r', encoding='utf-8') as f:
+                header_xml = f.read()
+            with open(os.path.join(reference_path, 'Contents', 'section0.xml'), 'r', encoding='utf-8') as f:
+                section0_xml = f.read()
+        else:
+            with zipfile.ZipFile(reference_path, 'r') as ref_zip:
+                header_xml = ref_zip.read('Contents/header.xml').decode('utf-8')
+                section0_xml = ref_zip.read('Contents/section0.xml').decode('utf-8')
         
         # Read input file content if it's HTML
         html_content = None
