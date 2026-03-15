@@ -2006,11 +2006,21 @@ class PandocToHwpx:
         # Create output HWPX
         with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as out_zip:
             # Copy all files from reference except header.xml and section0.xml
-            with zipfile.ZipFile(reference_path, 'r') as ref_zip:
-                for item in ref_zip.namelist():
-                    if item not in ['Contents/header.xml', 'Contents/section0.xml']:
-                        out_zip.writestr(item, ref_zip.read(item))
-            
+            skip = {'Contents/header.xml', 'Contents/section0.xml'}
+            if os.path.isdir(reference_path):
+                for root, _, files in os.walk(reference_path):
+                    for fname in files:
+                        abs_path = os.path.join(root, fname)
+                        arc_name = os.path.relpath(abs_path, reference_path).replace(os.sep, '/')
+                        if arc_name not in skip:
+                            with open(abs_path, 'rb') as f:
+                                out_zip.writestr(arc_name, f.read())
+            else:
+                with zipfile.ZipFile(reference_path, 'r') as ref_zip:
+                    for item in ref_zip.namelist():
+                        if item not in skip:
+                            out_zip.writestr(item, ref_zip.read(item))
+
             # Write modified files
             out_zip.writestr('Contents/header.xml', modified_header.encode('utf-8'))
             out_zip.writestr('Contents/section0.xml', section_xml.encode('utf-8'))
