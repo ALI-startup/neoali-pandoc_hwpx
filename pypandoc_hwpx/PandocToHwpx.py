@@ -18,91 +18,77 @@ class HTMLStyleExtractor(HTMLParser):
         super().__init__()
         self.style_stack = []
         self.text_segments = []
-        self.para_styles = []  # NEW: Track paragraph-level styles
-        
+        self.para_styles = []
+
     def handle_starttag(self, tag, attrs):
         style_dict = {}
         for attr, value in attrs:
             if attr == 'style':
-                # Parse inline CSS
                 for style_part in value.split(';'):
                     if ':' in style_part:
                         key, val = style_part.split(':', 1)
                         key = key.strip().lower()
                         val = val.strip()
                         style_dict[key] = val
-        
-        # NEW: Track paragraph-level styles
         if tag == 'p':
             self.para_styles.append(style_dict.copy())
-        
-        # Handle semantic tags
         if tag == 'strong' or tag == 'b':
             style_dict['font-weight'] = 'bold'
         elif tag == 'em' or tag == 'i':
             style_dict['font-style'] = 'italic'
         elif tag == 'u':
             style_dict['text-decoration'] = 'underline'
-        elif tag == 'span':
-            pass  # Span already captured in attrs
-            
         self.style_stack.append((tag, style_dict))
-    
+
     def handle_endtag(self, tag):
         if self.style_stack and self.style_stack[-1][0] == tag:
             self.style_stack.pop()
-    
+
     def handle_data(self, data):
         if data.strip():
-            # Combine all active styles
             combined_style = {}
             for tag, style in self.style_stack:
                 combined_style.update(style)
             self.text_segments.append((data, combined_style.copy()))
 
+
 class HTMLParagraphStyleExtractor(HTMLParser):
     """Extract paragraph-level styles from HTML before Pandoc processing"""
     def __init__(self):
         super().__init__()
-        self.para_styles = {}  # Map content_hash -> styles_dict
+        self.para_styles = {}
         self.current_para_content = []
         self.current_para_styles = {}
         self.in_paragraph = False
-        
+
     def handle_starttag(self, tag, attrs):
         if tag == 'p':
             self.in_paragraph = True
             self.current_para_content = []
             attrs_dict = dict(attrs)
             self.current_para_styles = {}
-            
             if 'style' in attrs_dict:
                 for style_part in attrs_dict['style'].split(';'):
                     if ':' in style_part:
                         key, val = style_part.split(':', 1)
                         key = key.strip().lower()
                         val = val.strip()
-                        
                         if key == 'padding-left':
                             self.current_para_styles['padding-left'] = val
                         elif key == 'margin-left':
                             self.current_para_styles['margin-left'] = val
                         elif key == 'text-indent':
                             self.current_para_styles['text-indent'] = val
-    
+
     def handle_endtag(self, tag):
         if tag == 'p' and self.in_paragraph:
-            # Create a hash from the paragraph content
             content_text = ''.join(self.current_para_content).strip()
             if content_text and self.current_para_styles:
-                # Use first 100 chars as key to identify paragraph
-                content_key = content_text[:100]
-                self.para_styles[content_key] = self.current_para_styles.copy()
-            
+                self.para_styles[content_text[:100]] = self.current_para_styles.copy()
             self.in_paragraph = False
             self.current_para_content = []
             self.current_para_styles = {}
-    
+
     def handle_data(self, data):
         if self.in_paragraph:
             self.current_para_content.append(data)
@@ -114,29 +100,17 @@ class PandocToHwpx:
         self.output = []
         self.header_xml_content = header_xml_content
         self.html_content = html_content
-        
-        # NEW: Extract paragraph styles from HTML before processing
-        self.html_para_styles = {}  # Map para_index -> styles_dict
+
+        self.html_para_styles = {}
         if html_content:
             self._extract_html_para_styles(html_content)
-        
-        # Default Style Mappings (Fallback)
-        self.STYLE_MAP = {
-            'Normal': 0,
-            'Header1': 1,
-            'Header2': 2,
-            'Header3': 3,
-            'Header4': 4,
-            'Header5': 5,
-            'Header6': 6,
-        }
-        
-        # Dynamic Style Mappings from header.xml
+
+        self.STYLE_MAP = {'Normal': 0, 'Header1': 1, 'Header2': 2, 'Header3': 3,
+                          'Header4': 4, 'Header5': 5, 'Header6': 6}
         self.dynamic_style_map = {}
-        self.normal_style_id = 0 
+        self.normal_style_id = 0
         self.normal_para_pr_id = 1
-        
-        # XML Tree and CharPr Cache
+
         self.header_tree = None
         self.header_root = None
         self.namespaces = {
@@ -145,34 +119,26 @@ class PandocToHwpx:
             'hc': 'http://www.hancom.co.kr/hwpml/2011/core',
             'hs': 'http://www.hancom.co.kr/hwpml/2011/section'
         }
-        # cache key: (base_char_pr_id, frozenset(active_formats), color, font_size) -> new_char_pr_id
-        self.char_pr_cache = {} 
+        self.char_pr_cache = {}
         self.max_char_pr_id = 0
         self.max_para_pr_id = 0
         self.max_border_fill_id = 0
-        
-        # NEW: ParaPr cache for indented paragraphs
-        self.para_pr_cache = {}  # key: (padding_left, text_indent) -> para_pr_id
-        
-        self.images = [] # metadata for images
-        
-        # Table-related attributes (from original)
+        self.para_pr_cache = {}
+        self.images = []
         self.table_border_fill_id = None
 
-        # Metadata extraction
         self.title = None
         self._extract_metadata()
 
         if self.header_xml_content:
             self._parse_styles_and_init_xml(self.header_xml_content)
 
+    # ------------------------------------------------------------------ helpers
+
     def _extract_html_para_styles(self, html_content):
-        """Extract paragraph styles from HTML before Pandoc processes it"""
         try:
             extractor = HTMLParagraphStyleExtractor()
             extractor.feed(html_content)
-            
-            # Store content-based styles dictionary
             self.html_para_styles = extractor.para_styles
         except Exception as e:
             print(f"[Warn] Failed to extract HTML paragraph styles: {e}", file=sys.stderr)
@@ -181,16 +147,13 @@ class PandocToHwpx:
         if not self.ast:
             return
         meta = self.ast.get('meta', {})
-        
-        # Title
         if 'title' in meta:
-             t_obj = meta['title']
-             # "title": {"t": "MetaInlines","c": [{"t": "Str","c": "..."}]}
-             if t_obj.get('t') == 'MetaInlines':
-                 self.title = self._get_plain_text(t_obj.get('c', []))
-             elif t_obj.get('t') == 'MetaString': # Sometimes simple string
-                 self.title = t_obj.get('c', "")
-        
+            t_obj = meta['title']
+            if t_obj.get('t') == 'MetaInlines':
+                self.title = self._get_plain_text(t_obj.get('c', []))
+            elif t_obj.get('t') == 'MetaString':
+                self.title = t_obj.get('c', "")
+
     def _get_plain_text(self, inlines):
         if not isinstance(inlines, list):
             return ""
@@ -202,119 +165,75 @@ class PandocToHwpx:
                 text.append(c)
             elif t == 'Space':
                 text.append(" ")
-            elif t in ['Strong', 'Emph', 'Underline', 'Strikeout', 'Superscript', 'Subscript', 'SmallCaps']:
-                 text.append(self._get_plain_text(c)) # recursive
+            elif t in ['Strong', 'Emph', 'Underline', 'Strikeout',
+                       'Superscript', 'Subscript', 'SmallCaps']:
+                text.append(self._get_plain_text(c))
             elif t == 'Span':
-                 # c = [attr, [inlines]]
-                 text.append(self._get_plain_text(c[1]))
+                text.append(self._get_plain_text(c[1]))
             elif t == 'Link':
-                 # c = [attr, [text], [url, title]]
-                 text.append(self._get_plain_text(c[1]))
+                text.append(self._get_plain_text(c[1]))
             elif t == 'Image':
-                 # c = [attr, [caption], [url, title]]
-                 text.append(self._get_plain_text(c[1]))
+                text.append(self._get_plain_text(c[1]))
             elif t == 'Code':
-                 text.append(c[1])
+                text.append(c[1])
             elif t == 'Quoted':
-                 # c = [quoteType, [inlines]]
-                 text.append('"' + self._get_plain_text(c[1]) + '"')
-            elif t == 'LineBreak' or t == 'SoftBreak':
-                 text.append("\n")
+                text.append('"' + self._get_plain_text(c[1]) + '"')
+            elif t in ('LineBreak', 'SoftBreak'):
+                text.append("\n")
         return "".join(text)
 
     def _convert_color_to_hwp(self, color):
-        """Convert CSS color to HWP format (#RRGGBB)"""
         if not color:
             return '#000000'
-            
-        # Named colors map
         color_map = {
-            'red': '#FF0000',
-            'green': '#008000',
-            'blue': '#0000FF',
-            'black': '#000000',
-            'white': '#FFFFFF',
-            'yellow': '#FFFF00',
-            'cyan': '#00FFFF',
-            'magenta': '#FF00FF',
-            'orange': '#FFA500',
-            'purple': '#800080',
-            'pink': '#FFC0CB',
-            'brown': '#A52A2A',
-            'gray': '#808080',
-            'grey': '#808080',
-            'lime': '#00FF00',
-            'navy': '#000080',
-            'teal': '#008080',
-            'silver': '#C0C0C0',
-            'maroon': '#800000',
-            'olive': '#808000',
+            'red': '#FF0000', 'green': '#008000', 'blue': '#0000FF',
+            'black': '#000000', 'white': '#FFFFFF', 'yellow': '#FFFF00',
+            'cyan': '#00FFFF', 'magenta': '#FF00FF', 'orange': '#FFA500',
+            'purple': '#800080', 'pink': '#FFC0CB', 'brown': '#A52A2A',
+            'gray': '#808080', 'grey': '#808080', 'lime': '#00FF00',
+            'navy': '#000080', 'teal': '#008080', 'silver': '#C0C0C0',
+            'maroon': '#800000', 'olive': '#808000',
         }
-        
         color = color.lower().strip()
-        
-        # If it's a named color
         if color in color_map:
             return color_map[color]
-        
-        # If it's already hex
         if color.startswith('#'):
-            if len(color) == 7:  # #RRGGBB
+            if len(color) == 7:
                 return color.upper()
-            elif len(color) == 4:  # #RGB -> #RRGGBB
+            elif len(color) == 4:
                 r, g, b = color[1], color[2], color[3]
                 return f'#{r}{r}{g}{g}{b}{b}'.upper()
-        
-        # If it's rgb(r, g, b)
         if color.startswith('rgb'):
-            import re
             match = re.search(r'rgb\s*\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)', color)
             if match:
                 r, g, b = int(match.group(1)), int(match.group(2)), int(match.group(3))
                 return f'#{r:02X}{g:02X}{b:02X}'
-        
         return '#000000'
 
     def _convert_size_to_hwp(self, size_str):
-        """Convert CSS font-size to HWP point size"""
         if not size_str:
             return None
-            
         size_str = size_str.lower().strip()
-        
-        # If it's already in pt
         if size_str.endswith('pt'):
             try:
                 return int(float(size_str[:-2]))
             except:
                 return None
-        
-        # If it's in px (assuming 96 DPI)
         if size_str.endswith('px'):
             try:
-                px = float(size_str[:-2])
-                pt = px * 72 / 96  # Convert px to pt
-                return int(pt)
+                return int(float(size_str[:-2]) * 72 / 96)
             except:
                 return None
-        
-        # If it's a number without unit, assume pt
         try:
             return int(float(size_str))
         except:
             return None
 
     def _extract_style_from_attr(self, attr):
-        """Extract style information from Pandoc attributes"""
-        # attr = [id, [classes], [[key, val], ...]]
         styles = {}
-        
         if len(attr) < 3:
             return styles
-        
-        # Check classes for common formatting
-        classes = attr[1]
-        for cls in classes:
+        for cls in attr[1]:
             cls_lower = cls.lower()
             if 'bold' in cls_lower or 'strong' in cls_lower:
                 styles['bold'] = True
@@ -322,300 +241,150 @@ class PandocToHwpx:
                 styles['italic'] = True
             if 'underline' in cls_lower:
                 styles['underline'] = True
-        
-        # Check key-value pairs for inline styles
-        kv_pairs = attr[2]
-        for key, val in kv_pairs:
-            key_lower = key.lower()
-            if key_lower == 'style':
-                # Parse CSS style string
-                for style_part in val.split(';'):
-                    if ':' in style_part:
-                        style_key, style_val = style_part.split(':', 1)
-                        style_key = style_key.strip().lower()
-                        style_val = style_val.strip()
-                        
-                        if style_key == 'color':
-                            styles['color'] = self._convert_color_to_hwp(style_val)
-                        elif style_key == 'font-size':
-                            styles['font-size'] = self._convert_size_to_hwp(style_val)
-                        elif style_key == 'font-weight':
-                            if 'bold' in style_val.lower():
-                                styles['bold'] = True
-                        elif style_key == 'font-style':
-                            if 'italic' in style_val.lower():
-                                styles['italic'] = True
-                        elif style_key == 'text-decoration':
-                            if 'underline' in style_val.lower():
+        for key, val in attr[2]:
+            if key.lower() == 'style':
+                for part in val.split(';'):
+                    if ':' in part:
+                        sk, sv = part.split(':', 1)
+                        sk, sv = sk.strip().lower(), sv.strip()
+                        if sk == 'color':
+                            styles['color'] = self._convert_color_to_hwp(sv)
+                        elif sk == 'font-size':
+                            styles['font-size'] = self._convert_size_to_hwp(sv)
+                        elif sk == 'font-weight' and 'bold' in sv.lower():
+                            styles['bold'] = True
+                        elif sk == 'font-style' and 'italic' in sv.lower():
+                            styles['italic'] = True
+                        elif sk == 'text-decoration':
+                            if 'underline' in sv.lower():
                                 styles['underline'] = True
-                            if 'line-through' in style_val.lower():
+                            if 'line-through' in sv.lower():
                                 styles['strikeout'] = True
-                        # NEW: Extract padding/indent for paragraphs
-                        elif style_key == 'padding-left':
-                            styles['padding-left'] = self._convert_size_to_hwp(style_val)
-                        elif style_key == 'margin-left':
-                            styles['margin-left'] = self._convert_size_to_hwp(style_val)
-                        elif style_key == 'text-indent':
-                            styles['text-indent'] = self._convert_size_to_hwp(style_val)
-        
+                        elif sk == 'padding-left':
+                            styles['padding-left'] = self._convert_size_to_hwp(sv)
+                        elif sk == 'margin-left':
+                            styles['margin-left'] = self._convert_size_to_hwp(sv)
+                        elif sk == 'text-indent':
+                            styles['text-indent'] = self._convert_size_to_hwp(sv)
         return styles
 
     def _parse_styles_and_init_xml(self, header_xml_content):
-        """Parse header.xml and initialize style mappings with XML tree"""
         try:
-            # Register namespaces
             for prefix, uri in self.namespaces.items():
                 ET.register_namespace(prefix, uri)
-            
             self.header_tree = ET.ElementTree(ET.fromstring(header_xml_content))
             self.header_root = self.header_tree.getroot()
-            
-            # Find max IDs
-            for char_pr in self.header_root.findall('.//hh:charPr', self.namespaces):
-                char_id = int(char_pr.get('id', 0))
-                if char_id > self.max_char_pr_id:
-                    self.max_char_pr_id = char_id
-            
-            for para_pr in self.header_root.findall('.//hh:paraPr', self.namespaces):
-                para_id = int(para_pr.get('id', 0))
-                if para_id > self.max_para_pr_id:
-                    self.max_para_pr_id = para_id
-            
-            for border_fill in self.header_root.findall('.//hh:borderFill', self.namespaces):
-                bf_id = int(border_fill.get('id', 0))
-                if bf_id > self.max_border_fill_id:
-                    self.max_border_fill_id = bf_id
-            
-            # Find Normal style
-            styles = self.header_root.findall('.//hh:style', self.namespaces)
-            for style in styles:
-                style_name = style.get('name', '')
-                style_id = int(style.get('id', 0))
-                
-                if style_name == 'Normal' or style_name == '바탕글':
-                    self.normal_style_id = style_id
+
+            for cp in self.header_root.findall('.//hh:charPr', self.namespaces):
+                cid = int(cp.get('id', 0))
+                if cid > self.max_char_pr_id:
+                    self.max_char_pr_id = cid
+            for pp in self.header_root.findall('.//hh:paraPr', self.namespaces):
+                pid = int(pp.get('id', 0))
+                if pid > self.max_para_pr_id:
+                    self.max_para_pr_id = pid
+            for bf in self.header_root.findall('.//hh:borderFill', self.namespaces):
+                bid = int(bf.get('id', 0))
+                if bid > self.max_border_fill_id:
+                    self.max_border_fill_id = bid
+
+            for style in self.header_root.findall('.//hh:style', self.namespaces):
+                name = style.get('name', '')
+                sid = int(style.get('id', 0))
+                if name in ('Normal', '바탕글'):
+                    self.normal_style_id = sid
                     self.normal_para_pr_id = int(style.get('paraPrIDRef', 1))
-                
-                self.dynamic_style_map[style_name] = style_id
-            
+                self.dynamic_style_map[name] = sid
         except Exception as e:
             print(f"[Warn] Failed to parse header.xml: {e}", file=sys.stderr)
 
-    def _get_or_create_char_pr(self, base_char_pr_id=0, active_formats=None, color=None, font_size=None):
-        """Get or create a charPr with specified formatting - using correct HWPX format"""
+    # ------------------------------------------------------------------ charPr
+
+    def _get_or_create_char_pr(self, base_char_pr_id=0, active_formats=None,
+                                color=None, font_size=None):
         if active_formats is None:
             active_formats = set()
-        
         base_char_pr_id = str(base_char_pr_id)
-        
-        # Create cache key
         cache_key = (base_char_pr_id, frozenset(active_formats), color, font_size)
-        
         if cache_key in self.char_pr_cache:
             return self.char_pr_cache[cache_key]
-        
-        # If no formatting needed, return base
         if not active_formats and not color and not font_size:
             return base_char_pr_id
-        
-        # Create new charPr
         if self.header_root is None:
             return base_char_pr_id
-        
-        base_node = self.header_root.find(f'.//hh:charPr[@id="{base_char_pr_id}"]', self.namespaces)
+
+        base_node = self.header_root.find(
+            f'.//hh:charPr[@id="{base_char_pr_id}"]', self.namespaces)
         if base_node is None:
             base_node = self.header_root.find('.//hh:charPr[@id="0"]', self.namespaces)
-            if base_node is None:
-                return base_char_pr_id
-        
+        if base_node is None:
+            return base_char_pr_id
+
         new_node = copy.deepcopy(base_node)
         self.max_char_pr_id += 1
         new_id = str(self.max_char_pr_id)
         new_node.set('id', new_id)
-        
-        # Apply color as ATTRIBUTE (not child element)
+
         if color:
             new_node.set('textColor', color)
-            
-            # Also update underline color if underline exists
             ul = new_node.find('hh:underline', self.namespaces)
             if ul is not None:
                 ul.set('color', color)
-        
-        # Apply font size as ATTRIBUTE (not child element)
-        # HWPX height: 1000 = 10pt, so multiply pt by 100
         if font_size:
             new_node.set('height', str(font_size * 100))
-        
-        # Apply formatting using CHILD ELEMENTS
         if 'BOLD' in active_formats:
             if new_node.find('hh:bold', self.namespaces) is None:
                 ET.SubElement(new_node, '{http://www.hancom.co.kr/hwpml/2011/head}bold')
-        
         if 'ITALIC' in active_formats:
             if new_node.find('hh:italic', self.namespaces) is None:
                 ET.SubElement(new_node, '{http://www.hancom.co.kr/hwpml/2011/head}italic')
-                
         if 'UNDERLINE' in active_formats:
             ul = new_node.find('hh:underline', self.namespaces)
             if ul is None:
                 ul = ET.SubElement(new_node, '{http://www.hancom.co.kr/hwpml/2011/head}underline')
             ul.set('type', 'BOTTOM')
             ul.set('shape', 'SOLID')
-            if color:
-                ul.set('color', color)
-            else:
-                ul.set('color', '#000000')
-        
+            ul.set('color', color if color else '#000000')
         if 'STRIKEOUT' in active_formats:
             st = new_node.find('hh:strikeout', self.namespaces)
             if st is None:
                 st = ET.SubElement(new_node, '{http://www.hancom.co.kr/hwpml/2011/head}strikeout')
             st.set('shape', 'CONTINUOUS')
             st.set('color', color if color else '#000000')
-        
         if 'SUPERSCRIPT' in active_formats:
             sub = new_node.find('hh:subscript', self.namespaces)
             if sub is not None:
                 new_node.remove(sub)
             if new_node.find('hh:supscript', self.namespaces) is None:
                 ET.SubElement(new_node, '{http://www.hancom.co.kr/hwpml/2011/head}supscript')
-        
         elif 'SUBSCRIPT' in active_formats:
             sup = new_node.find('hh:supscript', self.namespaces)
             if sup is not None:
                 new_node.remove(sup)
             if new_node.find('hh:subscript', self.namespaces) is None:
                 ET.SubElement(new_node, '{http://www.hancom.co.kr/hwpml/2011/head}subscript')
-        
-        # Add to header
+
         char_props = self.header_root.find('.//hh:charProperties', self.namespaces)
         if char_props is not None:
             char_props.append(new_node)
-        
-        # Cache and return
         self.char_pr_cache[cache_key] = new_id
         return new_id
 
+    # ------------------------------------------------------------------ paraPr
+
     def _get_or_create_para_pr(self, padding_left=0, text_indent=0):
-        """NEW: Get or create a paraPr with specified indentation"""
-        # Convert pt to HWPUNIT (1pt ≈ 100 HWPUNIT)
         left_margin = int(padding_left * 100) if padding_left else 0
         indent_val = int(text_indent * 100) if text_indent else 0
-        
-        # Create cache key
         cache_key = (left_margin, indent_val)
-        
         if cache_key in self.para_pr_cache:
             return self.para_pr_cache[cache_key]
-        
-        # If no indentation, return normal
         if left_margin == 0 and indent_val == 0:
             return str(self.normal_para_pr_id)
-        
-        # Create new paraPr
-        if self.header_root is None:
-            return str(self.normal_para_pr_id)
-        
-        # Get base paraPr
-        base_node = self.header_root.find(f'.//hh:paraPr[@id="{self.normal_para_pr_id}"]', self.namespaces)
-        if base_node is None:
-            base_node = self.header_root.find('.//hh:paraPr[@id="0"]', self.namespaces)
-            if base_node is None:
-                return str(self.normal_para_pr_id)
-        
-        new_node = copy.deepcopy(base_node)
-        self.max_para_pr_id += 1
-        new_id = str(self.max_para_pr_id)
-        new_node.set('id', new_id)
-        
-        # Add or modify margin element
-        # Look for existing switch/case/margin structure
-        switch_elem = new_node.find('hp:switch', self.namespaces)
-        if switch_elem is None:
-            switch_elem = ET.SubElement(new_node, '{http://www.hancom.co.kr/hwpml/2011/paragraph}switch')
-        
-        case_elem = switch_elem.find('hp:case', self.namespaces)
-        if case_elem is None:
-            case_elem = ET.SubElement(switch_elem, '{http://www.hancom.co.kr/hwpml/2011/paragraph}case')
-            case_elem.set('{http://www.hancom.co.kr/hwpml/2011/paragraph}required-namespace', 
-                         'http://www.hancom.co.kr/hwpml/2016/HwpUnitChar')
-        
-        margin_elem = case_elem.find('hh:margin', self.namespaces)
-        if margin_elem is None:
-            margin_elem = ET.SubElement(case_elem, '{http://www.hancom.co.kr/hwpml/2011/head}margin')
-        
-        # Set margin values
-        # intent = text-indent (negative for hanging indent)
-        # left = padding-left/margin-left
-        intent_elem = margin_elem.find('hc:intent', self.namespaces)
-        if intent_elem is None:
-            intent_elem = ET.SubElement(margin_elem, '{http://www.hancom.co.kr/hwpml/2011/core}intent')
-        intent_elem.set('value', str(indent_val))
-        intent_elem.set('unit', 'HWPUNIT')
-        
-        left_elem = margin_elem.find('hc:left', self.namespaces)
-        if left_elem is None:
-            left_elem = ET.SubElement(margin_elem, '{http://www.hancom.co.kr/hwpml/2011/core}left')
-        left_elem.set('value', str(left_margin))
-        left_elem.set('unit', 'HWPUNIT')
-        
-        # Also add to default
-        default_elem = switch_elem.find('hp:default', self.namespaces)
-        if default_elem is None:
-            default_elem = ET.SubElement(switch_elem, '{http://www.hancom.co.kr/hwpml/2011/paragraph}default')
-        
-        default_margin = default_elem.find('hh:margin', self.namespaces)
-        if default_margin is None:
-            default_margin = ET.SubElement(default_elem, '{http://www.hancom.co.kr/hwpml/2011/head}margin')
-        
-        default_intent = default_margin.find('hc:intent', self.namespaces)
-        if default_intent is None:
-            default_intent = ET.SubElement(default_margin, '{http://www.hancom.co.kr/hwpml/2011/core}intent')
-        default_intent.set('value', str(indent_val))
-        default_intent.set('unit', 'HWPUNIT')
-        
-        default_left = default_margin.find('hc:left', self.namespaces)
-        if default_left is None:
-            default_left = ET.SubElement(default_margin, '{http://www.hancom.co.kr/hwpml/2011/core}left')
-        default_left.set('value', str(left_margin))
-        default_left.set('unit', 'HWPUNIT')
-        
-        # Add to header
-        para_props = self.header_root.find('.//hh:paraProperties', self.namespaces)
-        if para_props is not None:
-            para_props.append(new_node)
-        
-        # Cache and return
-        self.para_pr_cache[cache_key] = new_id
-        return new_id
-
-    # HWPUNIT per list depth level (1 HWPUNIT ≈ 1/7200 inch; 3600 ≈ 0.5 inch / ~1.27 cm)
-    LIST_INDENT_HWPUNIT = 3600
-
-    def _get_para_pr_for_list_depth(self, depth):
-        """Return a paraPrIDRef that adds left-margin indentation matching *depth* list levels.
-
-        depth=0 → top-level list  (1 level of indent)
-        depth=1 → nested list     (2 levels of indent)
-        …and so on.
-
-        The indentation is stored directly in HWPUNIT so we bypass the pt→HWPUNIT
-        conversion in _get_or_create_para_pr and call the internal cache directly.
-        """
-        left_margin = (depth + 1) * self.LIST_INDENT_HWPUNIT
-
-        cache_key = (left_margin, 0)  # no text-indent for list paragraphs
-        if cache_key in self.para_pr_cache:
-            return self.para_pr_cache[cache_key]
-
         if self.header_root is None:
             return str(self.normal_para_pr_id)
 
-        # Clone the base paraPr
         base_node = self.header_root.find(
-            f'.//hh:paraPr[@id="{self.normal_para_pr_id}"]', self.namespaces
-        )
+            f'.//hh:paraPr[@id="{self.normal_para_pr_id}"]', self.namespaces)
         if base_node is None:
             base_node = self.header_root.find('.//hh:paraPr[@id="0"]', self.namespaces)
         if base_node is None:
@@ -630,83 +399,86 @@ class PandocToHwpx:
         HH = 'http://www.hancom.co.kr/hwpml/2011/head'
         HC = 'http://www.hancom.co.kr/hwpml/2011/core'
 
-        def _set_margin(parent_elem):
-            margin = parent_elem.find('hh:margin', self.namespaces)
-            if margin is None:
-                margin = ET.SubElement(parent_elem, f'{{{HH}}}margin')
-            left = margin.find('hc:left', self.namespaces)
-            if left is None:
-                left = ET.SubElement(margin, f'{{{HC}}}left')
-            left.set('value', str(left_margin))
-            left.set('unit', 'HWPUNIT')
-            # Keep text-indent at 0
-            indent = margin.find('hc:intent', self.namespaces)
-            if indent is None:
-                indent = ET.SubElement(margin, f'{{{HC}}}intent')
-            indent.set('value', '0')
-            indent.set('unit', 'HWPUNIT')
-
-        # Apply to both <hp:switch><hp:default> and <hp:switch><hp:case> sub-trees
         switch_elem = new_node.find('hp:switch', self.namespaces)
         if switch_elem is None:
             switch_elem = ET.SubElement(new_node, f'{{{HP}}}switch')
 
-        default_elem = switch_elem.find('hp:default', self.namespaces)
-        if default_elem is None:
-            default_elem = ET.SubElement(switch_elem, f'{{{HP}}}default')
-        _set_margin(default_elem)
+        for container, make_if_missing in [
+            (switch_elem.find('hp:case', self.namespaces), True),
+            (switch_elem.find('hp:default', self.namespaces), True),
+        ]:
+            pass  # handled below
 
+        # case
         case_elem = switch_elem.find('hp:case', self.namespaces)
         if case_elem is None:
             case_elem = ET.SubElement(switch_elem, f'{{{HP}}}case')
-            case_elem.set(
-                f'{{{HP}}}required-namespace',
-                'http://www.hancom.co.kr/hwpml/2016/HwpUnitChar'
-            )
-        _set_margin(case_elem)
+            case_elem.set(f'{{{HP}}}required-namespace',
+                          'http://www.hancom.co.kr/hwpml/2016/HwpUnitChar')
+        margin_elem = case_elem.find('hh:margin', self.namespaces)
+        if margin_elem is None:
+            margin_elem = ET.SubElement(case_elem, f'{{{HH}}}margin')
+        for tag, val in [('hc:intent', indent_val), ('hc:left', left_margin)]:
+            elem = margin_elem.find(tag, self.namespaces)
+            if elem is None:
+                elem = ET.SubElement(margin_elem,
+                                     f'{{{HC}}}{tag.split(":")[1]}')
+            elem.set('value', str(val))
+            elem.set('unit', 'HWPUNIT')
 
-        # Also set the top-level <hh:margin> if the paraPr has one directly
-        direct_margin = new_node.find('hh:margin', self.namespaces)
-        if direct_margin is not None:
-            _set_margin(new_node)
+        # default
+        default_elem = switch_elem.find('hp:default', self.namespaces)
+        if default_elem is None:
+            default_elem = ET.SubElement(switch_elem, f'{{{HP}}}default')
+        def_margin = default_elem.find('hh:margin', self.namespaces)
+        if def_margin is None:
+            def_margin = ET.SubElement(default_elem, f'{{{HH}}}margin')
+        for tag, val in [('hc:intent', indent_val), ('hc:left', left_margin)]:
+            elem = def_margin.find(tag, self.namespaces)
+            if elem is None:
+                elem = ET.SubElement(def_margin,
+                                     f'{{{HC}}}{tag.split(":")[1]}')
+            elem.set('value', str(val))
+            elem.set('unit', 'HWPUNIT')
 
-        # Register in header
         para_props = self.header_root.find('.//hh:paraProperties', self.namespaces)
         if para_props is not None:
             para_props.append(new_node)
+        self.para_pr_cache[cache_key] = new_id
+        return new_id
 
+    # 1 HWPUNIT ≈ 1/7200 inch; 3600 ≈ 0.5 inch / ~1.27 cm
+    LIST_INDENT_HWPUNIT = 3600
+
+    def _get_para_pr_for_list_depth(self, depth):
+        """Return paraPrIDRef with left-margin for the given list depth level."""
+        left_margin = (depth + 1) * self.LIST_INDENT_HWPUNIT
+        cache_key = (left_margin, 0)
+        if cache_key in self.para_pr_cache:
+            return self.para_pr_cache[cache_key]
+        new_id = self._create_para_pr_with_margin(left_margin)
         self.para_pr_cache[cache_key] = new_id
         return new_id
 
     def _get_left_margin_from_para_pr(self, para_pr_id):
-        """Return the left-margin value (in HWPUNIT) stored in the given paraPr node.
-
-        Used so that tables placed inside list items can set an identical
-        horzOffset, making them visually align with the surrounding text.
-        Falls back to 0 if the paraPr or its margin element cannot be found.
-        """
-        # Fast path: check para_pr_cache in reverse to find matching left_margin
+        """Return the left-margin HWPUNIT value stored in the given paraPrIDRef."""
+        # Fast path via cache
         for cache_key, pid in self.para_pr_cache.items():
             if not isinstance(cache_key, tuple) or len(cache_key) != 2:
                 continue
             left_margin, _indent = cache_key
             if pid == str(para_pr_id):
                 return left_margin
-
-        # Slow path: read directly from header XML
+        # Slow path via XML
         if self.header_root is None:
             return 0
         node = self.header_root.find(f'.//hh:paraPr[@id="{para_pr_id}"]', self.namespaces)
         if node is None:
             return 0
-
-        # Look inside switch/default/margin/left  or switch/case/margin/left
-        for container_path in (
-            'hp:switch/hp:default/hh:margin/hc:left',
-            'hp:switch/hp:case/hh:margin/hc:left',
-            'hh:margin/hc:left',
-        ):
-            elem = node.find(container_path, self.namespaces)
+        for path in ('hp:switch/hp:default/hh:margin/hc:left',
+                     'hp:switch/hp:case/hh:margin/hc:left',
+                     'hh:margin/hc:left'):
+            elem = node.find(path, self.namespaces)
             if elem is not None:
                 try:
                     return int(elem.get('value', 0))
@@ -714,964 +486,8 @@ class PandocToHwpx:
                     pass
         return 0
 
-    def _escape_text(self, text):
-        return saxutils.escape(text)
-
-    def _create_para_start(self, style_id=0, para_pr_id=1, column_break=0, merged=0):
-        # merged=0 is default
-        return f'<hp:p paraPrIDRef="{para_pr_id}" styleIDRef="{style_id}" pageBreak="0" columnBreak="{column_break}" merged="{merged}">'
-
-    def _create_run_start(self, char_pr_id=0):
-        return f'<hp:run charPrIDRef="{char_pr_id}">'
-    
-    def _create_text_run(self, text, char_pr_id=0):
-        run_xml = self._create_run_start(char_pr_id)
-        run_xml += f'<hp:t>{self._escape_text(text)}</hp:t>'
-        run_xml += '</hp:run>'
-        return run_xml
-
-    def _handle_table(self, content, para_pr_id=None):
-        """Handle table from Pandoc AST with proper spanning cell support.
-
-        para_pr_id: optional paraPrIDRef to use for the wrapping paragraph.
-                    When supplied (e.g. from inside a list), the table is
-                    indented to match the list level via both paraPr left-margin
-                    and the table's horzOffset attribute.
-        """
-        specs = content[2]
-        table_head = content[3]
-        table_bodies = content[4] 
-        table_foot = content[5]
-        
-        # 1. Flatten Rows
-        all_rows = []
-        
-        # Head Rows
-        head_rows = table_head[1]
-        for row in head_rows:
-            all_rows.append(row)
-            
-        # Body Rows
-        for body in table_bodies:
-            inter_headers = body[2]
-            for row in inter_headers:
-                all_rows.append(row)
-            
-            main_rows = body[3]
-            for row in main_rows:
-                all_rows.append(row)
-        
-        # Foot Rows
-        foot_rows = table_foot[1]
-        for row in foot_rows:
-            all_rows.append(row)
-            
-        if not all_rows:
-            return ""
-
-        # 2. Build cell grid to determine actual table dimensions
-        cell_grid = {}  # (row, col) -> cell_info
-        max_row = 0
-        max_col = 0
-        
-        for row_idx, row in enumerate(all_rows):
-            cells = row[1]
-            curr_col = 0
-            
-            for cell in cells:
-                # Find next free column
-                while (row_idx, curr_col) in cell_grid:
-                    curr_col += 1
-                
-                rowspan = cell[2]
-                colspan = cell[3]
-                
-                # Mark all cells occupied by this cell
-                for r in range(rowspan):
-                    for c in range(colspan):
-                        cell_grid[(row_idx + r, curr_col + c)] = {
-                            'origin_row': row_idx,
-                            'origin_col': curr_col,
-                            'rowspan': rowspan,
-                            'colspan': colspan,
-                            'blocks': cell[4]
-                        }
-                
-                max_row = max(max_row, row_idx + rowspan - 1)
-                max_col = max(max_col, curr_col + colspan - 1)
-                
-                curr_col += colspan
-        
-        row_cnt = max_row + 1
-        col_cnt = max_col + 1
-        
-        # 3. Calculate Widths — deferred until we know the indent offset
-        TOTAL_TABLE_WIDTH = 45000
-            
-        # 4. Generate Table XML
-        import time
-        import random
-        tbl_id = str(int(time.time() * 1000) % 100000000 + random.randint(0, 10000))
-
-        xml_parts = []
-
-        # Para Start — use caller-supplied para_pr_id (e.g. from list context) or default
-        effective_para_pr_id = para_pr_id if para_pr_id is not None else self.normal_para_pr_id
-        xml_parts.append(self._create_para_start(style_id=self.normal_style_id, para_pr_id=effective_para_pr_id))
-        xml_parts.append(self._create_run_start(char_pr_id=0))
-        
-        # Ensure table borderFill exists
-        if self.table_border_fill_id is None:
-            self._ensure_table_border_fill()
-
-        # The paraPr left-margin already shifts the entire paragraph (and the
-        # table inside it) to the correct list indent position.  horzOffset
-        # must therefore stay at 0 to avoid a second, additive shift.
-        # We still shrink the table width by the indent amount so it doesn't
-        # overflow the right page margin.
-        para_left_margin = self._get_left_margin_from_para_pr(effective_para_pr_id)
-        effective_width = TOTAL_TABLE_WIDTH - para_left_margin
-        col_widths = [int(effective_width / col_cnt) for _ in range(col_cnt)]
-        
-        # Table properties
-        xml_parts.append(f'<hp:tbl id="{tbl_id}" zOrder="0" numberingType="TABLE" textWrap="TOP_AND_BOTTOM" textFlow="BOTH_SIDES" lock="0" dropcapstyle="None" pageBreak="CELL" repeatHeader="1" rowCnt="{row_cnt}" colCnt="{col_cnt}" cellSpacing="0" borderFillIDRef="{self.table_border_fill_id}" noAdjust="0">')
-        
-        # Dimensions
-        xml_parts.append(f'<hp:sz width="{effective_width}" widthRelTo="ABSOLUTE" height="{row_cnt * 1000}" heightRelTo="ABSOLUTE" protect="0"/>')
-        xml_parts.append('<hp:pos treatAsChar="0" affectLSpacing="0" flowWithText="1" allowOverlap="0" holdAnchorAndSO="0" vertRelTo="PARA" horzRelTo="COLUMN" vertAlign="TOP" horzAlign="LEFT" vertOffset="0" horzOffset="0"/>')
-        xml_parts.append('<hp:outMargin left="0" right="0" top="0" bottom="1417"/>')
-        xml_parts.append('<hp:inMargin left="510" right="510" top="141" bottom="141"/>')
-        
-        # 5. Generate Rows - only create cells for origin positions
-        processed_cells = set()
-        
-        for row_idx in range(row_cnt):
-            xml_parts.append('<hp:tr>')
-            
-            for col_idx in range(col_cnt):
-                if (row_idx, col_idx) not in cell_grid:
-                    continue
-                    
-                cell_info = cell_grid[(row_idx, col_idx)]
-                
-                # Only process if this is the origin cell
-                if cell_info['origin_row'] != row_idx or cell_info['origin_col'] != col_idx:
-                    continue
-                
-                # Prevent duplicate processing
-                cell_key = (row_idx, col_idx)
-                if cell_key in processed_cells:
-                    continue
-                processed_cells.add(cell_key)
-                
-                rowspan = cell_info['rowspan']
-                colspan = cell_info['colspan']
-                cell_blocks = cell_info['blocks']
-                
-                # Calculate cell width
-                cell_width = sum(col_widths[col_idx:col_idx + colspan])
-                
-                sublist_id = str(int(time.time() * 100000) % 1000000000 + random.randint(0, 100000))
-                
-                # Process cell content
-                cell_content_xml = self._process_blocks_for_table_cell(cell_blocks)
-                
-                # If cell content is empty, add empty paragraph
-                if not cell_content_xml.strip():
-                    cell_content_xml = self._create_para_start(style_id=self.normal_style_id, para_pr_id=self.normal_para_pr_id)
-                    cell_content_xml += '<hp:run charPrIDRef="0"><hp:t></hp:t></hp:run>'
-                    cell_content_xml += '</hp:p>'
-                
-                # TC Start
-                xml_parts.append(f'<hp:tc name="" header="0" hasMargin="0" protect="0" editable="0" dirty="0" borderFillIDRef="{self.table_border_fill_id}">')
-                
-                # SubList
-                xml_parts.append(f'<hp:subList id="{sublist_id}" textDirection="HORIZONTAL" lineWrap="BREAK" vertAlign="TOP" linkListIDRef="0" linkListNextIDRef="0" textWidth="0" textHeight="0" hasTextRef="0" hasNumRef="0">')
-                xml_parts.append(cell_content_xml)
-                xml_parts.append('</hp:subList>')
-                
-                # Cell Address & Span
-                xml_parts.append(f'<hp:cellAddr colAddr="{col_idx}" rowAddr="{row_idx}"/>')
-                xml_parts.append(f'<hp:cellSpan colSpan="{colspan}" rowSpan="{rowspan}"/>')
-                xml_parts.append(f'<hp:cellSz width="{cell_width}" height="1000"/>')
-                xml_parts.append('<hp:cellMargin left="510" right="510" top="141" bottom="141"/>')
-                
-                xml_parts.append('</hp:tc>')
-                
-            xml_parts.append('</hp:tr>')
-            
-        xml_parts.append('</hp:tbl>')
-        xml_parts.append('</hp:run>')
-        xml_parts.append('</hp:p>')
-        
-        return "".join(xml_parts)
-
-    def _ensure_table_border_fill(self):
-        """Ensure a borderFill for tables exists in header.xml"""
-        if self.table_border_fill_id is not None:
-            return self.table_border_fill_id
-
-        # Create new borderFill ID
-        self.max_border_fill_id += 1
-        self.table_border_fill_id = self.max_border_fill_id
-
-        if self.header_root is None:
-            return self.table_border_fill_id
-
-        # Create borderFill element
-        border_fill_xml = f'''<hh:borderFill xmlns:hh="http://www.hancom.co.kr/hwpml/2011/head" xmlns:hc="http://www.hancom.co.kr/hwpml/2011/core" id="{self.table_border_fill_id}" threeD="0" shadow="0" slash="NONE" backSlash="NONE" crookedSlash="0" counterstrike="0">
-    <hh:leftBorder type="SOLID" width="0.12 mm" color="#000000"/>
-    <hh:rightBorder type="SOLID" width="0.12 mm" color="#000000"/>
-    <hh:topBorder type="SOLID" width="0.12 mm" color="#000000"/>
-    <hh:bottomBorder type="SOLID" width="0.12 mm" color="#000000"/>
-    <hh:diagonal type="NONE" crooked="0"/>
-    <hc:fill>
-      <hc:fillColorPattern type="NONE" foreColor="#FFFFFF" backColor="#FFFFFF"/>
-    </hc:fill>
-</hh:borderFill>'''
-        
-        bf_elem = ET.fromstring(border_fill_xml)
-        bf_container = self.header_root.find('.//hh:borderFills', self.namespaces)
-        if bf_container is None:
-            bf_container = ET.SubElement(self.header_root, '{http://www.hancom.co.kr/hwpml/2011/head}borderFills')
-        bf_container.append(bf_elem)
-        
-        return self.table_border_fill_id
-
-    def _process_blocks_for_table_cell(self, blocks):
-        """Process Pandoc block elements specifically for table cells - handles linebreaks properly"""
-        result = []
-        for block_idx, block in enumerate(blocks):
-            if not isinstance(block, dict):
-                continue
-                
-            block_type = block.get('t')
-            content = block.get('c')
-            
-            if block_type == 'Para':
-                # For Para in table cells, process with linebreak awareness
-                result.append(self._handle_para_in_table(content))
-                
-            elif block_type == 'Plain':
-                # For Plain in table cells, process with linebreak awareness
-                result.append(self._handle_plain_in_table(content))
-                
-            elif block_type == 'Header':
-                result.append(self._handle_header(content))
-                
-            elif block_type == 'BulletList':
-                result.append(self._handle_bullet_list(content))
-                
-            elif block_type == 'OrderedList':
-                result.append(self._handle_ordered_list(content))
-                
-            elif block_type == 'Table':
-                # Nested table
-                table_xml = self._handle_table(content)
-                if table_xml:
-                    result.append(table_xml)
-                
-        return "\n".join(result)
-
-    def _handle_para_in_table(self, content):
-        """Handle paragraph in table cell - convert LineBreak to separate paragraphs"""
-        # Split content by LineBreak
-        segments = self._split_by_linebreak(content)
-        
-        result = []
-        for segment in segments:
-            if segment:  # Skip empty segments
-                xml = self._create_para_start(style_id=self.normal_style_id, para_pr_id=self.normal_para_pr_id)
-                xml += self._process_inlines(segment)
-                xml += '</hp:p>'
-                result.append(xml)
-        
-        # If no segments, return empty paragraph
-        if not result:
-            xml = self._create_para_start(style_id=self.normal_style_id, para_pr_id=self.normal_para_pr_id)
-            xml += '<hp:run charPrIDRef="0"><hp:t></hp:t></hp:run>'
-            xml += '</hp:p>'
-            result.append(xml)
-        
-        return "\n".join(result)
-
-    def _handle_plain_in_table(self, content):
-        """Handle plain text in table cell - convert LineBreak to separate paragraphs"""
-        # Split content by LineBreak
-        segments = self._split_by_linebreak(content)
-        
-        result = []
-        for segment in segments:
-            if segment:  # Skip empty segments
-                xml = self._create_para_start(style_id=self.normal_style_id, para_pr_id=self.normal_para_pr_id)
-                xml += self._process_inlines(segment)
-                xml += '</hp:p>'
-                result.append(xml)
-        
-        # If no segments, return empty paragraph
-        if not result:
-            xml = self._create_para_start(style_id=self.normal_style_id, para_pr_id=self.normal_para_pr_id)
-            xml += '<hp:run charPrIDRef="0"><hp:t></hp:t></hp:run>'
-            xml += '</hp:p>'
-            result.append(xml)
-        
-        return "\n".join(result)
-
-    def _split_by_linebreak(self, inlines):
-        """Split a list of inlines by LineBreak elements into segments"""
-        segments = []
-        current_segment = []
-        
-        for inline in inlines:
-            inline_type = inline.get('t')
-            
-            if inline_type == 'LineBreak':
-                # End current segment and start new one
-                segments.append(current_segment)
-                current_segment = []
-            else:
-                current_segment.append(inline)
-        
-        # Add the last segment
-        if current_segment:
-            segments.append(current_segment)
-        
-        return segments
-
-    def _handle_para(self, content, para_styles=None):
-        """Handle paragraph with style preservation - UPDATED to support indentation"""
-        # NEW: Get paragraph styles from pre-extracted HTML styles based on content
-        if para_styles is None and self.html_para_styles:
-            # Extract text content from this paragraph to match against HTML
-            para_text = self._get_plain_text(content)[:100]  # First 100 chars
-            
-            if para_text in self.html_para_styles:
-                html_styles = self.html_para_styles[para_text]
-                para_styles = {}
-                
-                if 'padding-left' in html_styles:
-                    para_styles['padding-left'] = self._convert_size_to_hwp(html_styles['padding-left'])
-                if 'margin-left' in html_styles:
-                    para_styles['margin-left'] = self._convert_size_to_hwp(html_styles['margin-left'])
-                if 'text-indent' in html_styles:
-                    para_styles['text-indent'] = self._convert_size_to_hwp(html_styles['text-indent'])
-        
-        # Check for paragraph-level indentation styles
-        padding_left = 0
-        text_indent = 0
-        
-        if para_styles:
-            padding_left = para_styles.get('padding-left', 0) or para_styles.get('margin-left', 0)
-            text_indent = para_styles.get('text-indent', 0)
-        
-        # Get or create paraPr with indentation
-        para_pr_id = self._get_or_create_para_pr(padding_left, text_indent)
-        
-        xml = self._create_para_start(style_id=self.normal_style_id, para_pr_id=para_pr_id) 
-        xml += self._process_inlines(content) 
-        xml += '</hp:p>'
-        return xml
-
-    def _handle_plain(self, content, para_styles=None):
-        """Handle plain text with style preservation - UPDATED to support indentation"""
-        # NEW: Get paragraph styles from pre-extracted HTML styles based on content
-        if para_styles is None and self.html_para_styles:
-            # Extract text content from this paragraph to match against HTML
-            para_text = self._get_plain_text(content)[:100]  # First 100 chars
-            
-            if para_text in self.html_para_styles:
-                html_styles = self.html_para_styles[para_text]
-                para_styles = {}
-                
-                if 'padding-left' in html_styles:
-                    para_styles['padding-left'] = self._convert_size_to_hwp(html_styles['padding-left'])
-                if 'margin-left' in html_styles:
-                    para_styles['margin-left'] = self._convert_size_to_hwp(html_styles['margin-left'])
-                if 'text-indent' in html_styles:
-                    para_styles['text-indent'] = self._convert_size_to_hwp(html_styles['text-indent'])
-        
-        # Check for paragraph-level indentation styles
-        padding_left = 0
-        text_indent = 0
-        
-        if para_styles:
-            padding_left = para_styles.get('padding-left', 0) or para_styles.get('margin-left', 0)
-            text_indent = para_styles.get('text-indent', 0)
-        
-        # Get or create paraPr with indentation
-        para_pr_id = self._get_or_create_para_pr(padding_left, text_indent)
-        
-        xml = self._create_para_start(style_id=self.normal_style_id, para_pr_id=para_pr_id)
-        xml += self._process_inlines(content)
-        xml += '</hp:p>'
-        return xml
-
-    def _handle_header(self, content):
-        """Handle headers"""
-        level = content[0]
-        inlines = content[2]
-        header_style = min(level, 6)  # Max header level 6
-        
-        xml = self._create_para_start(style_id=header_style)
-        xml += self._process_inlines(inlines)
-        xml += '</hp:p>'
-        return xml
-
-    def _handle_bullet_list(self, list_data, depth=0):
-        """Handle bullet lists with proper formatting, including tables inside list items"""
-        items = list_data if isinstance(list_data, list) else []
-        result = []
-
-        # Resolve indented paraPr for this depth level once
-        para_pr_id = self._get_para_pr_for_list_depth(depth)
-
-        for item in items:
-            if isinstance(item, list):
-                # Track whether this item had a text block (Plain/Para) before the table
-                has_text_block = False
-                for block in item:
-                    block_type = block.get('t')
-                    content = block.get('c')
-
-                    if block_type == 'Plain' or block_type == 'Para':
-                        result.append(self._create_para_start(
-                            style_id=self.normal_style_id, para_pr_id=para_pr_id))
-                        if not has_text_block:
-                            result.append('<hp:run charPrIDRef="0"><hp:t>• </hp:t></hp:run>')
-                            has_text_block = True
-                        result.append(self._process_inlines(content))
-                        result.append('</hp:p>')
-
-                    elif block_type == 'BulletList':
-                        result.append(self._handle_bullet_list(content, depth + 1))
-
-                    elif block_type == 'OrderedList':
-                        result.append(self._handle_ordered_list(content, depth + 1))
-
-                    elif block_type == 'Header':
-                        # Headers can appear as direct children of list items
-                        result.append(self._handle_header(content))
-
-                    elif block_type == 'HorizontalRule':
-                        result.append(self._handle_horizontal_rule())
-
-                    elif block_type == 'BlockQuote':
-                        result.append(self._handle_block_quote(content, para_pr_id=para_pr_id))
-
-                    elif block_type == 'Table':
-                        table_xml = self._handle_table(content, para_pr_id=para_pr_id)
-                        if table_xml:
-                            result.append(table_xml)
-
-                    elif block_type == 'Div':
-                        div_blocks = content[1] if (content and len(content) > 1) else []
-                        result.append(self._process_blocks_in_list(div_blocks, depth))
-
-                    elif block_type == 'RawBlock':
-                        raw_xml = self._handle_raw_block_in_list(content, para_pr_id=para_pr_id)
-                        if raw_xml:
-                            result.append(raw_xml)
-
-                    elif block_type == 'CodeBlock':
-                        result.append(self._handle_code_block(content))
-
-        return "\n".join(result)
-
-    def _handle_ordered_list(self, list_data, depth=0):
-        """Handle ordered lists with proper formatting, including tables inside list items"""
-        # list_data = [list_attributes, items]
-        items = list_data[1] if len(list_data) > 1 else []
-        result = []
-
-        # Resolve indented paraPr for this depth level once
-        para_pr_id = self._get_para_pr_for_list_depth(depth)
-
-        for idx, item in enumerate(items, 1):
-            # Each item is a list of blocks
-            if isinstance(item, list):
-                has_text_block = False
-                for block in item:
-                    block_type = block.get('t')
-                    content = block.get('c')
-
-                    if block_type == 'Plain' or block_type == 'Para':
-                        result.append(self._create_para_start(
-                            style_id=self.normal_style_id, para_pr_id=para_pr_id))
-                        if not has_text_block:
-                            result.append(f'<hp:run charPrIDRef="0"><hp:t>{idx}. </hp:t></hp:run>')
-                            has_text_block = True
-                        result.append(self._process_inlines(content))
-                        result.append('</hp:p>')
-
-                    elif block_type == 'BulletList':
-                        result.append(self._handle_bullet_list(content, depth + 1))
-
-                    elif block_type == 'OrderedList':
-                        result.append(self._handle_ordered_list(content, depth + 1))
-
-                    elif block_type == 'Header':
-                        result.append(self._handle_header(content))
-
-                    elif block_type == 'HorizontalRule':
-                        result.append(self._handle_horizontal_rule())
-
-                    elif block_type == 'BlockQuote':
-                        result.append(self._handle_block_quote(content, para_pr_id=para_pr_id))
-
-                    elif block_type == 'Table':
-                        # Table directly inside a list item
-                        table_xml = self._handle_table(content, para_pr_id=para_pr_id)
-                        if table_xml:
-                            result.append(table_xml)
-
-                    elif block_type == 'Div':
-                        # Div may wrap a table or other blocks inside a list item
-                        div_blocks = content[1] if (content and len(content) > 1) else []
-                        result.append(self._process_blocks_in_list(div_blocks, depth))
-
-                    elif block_type == 'RawBlock':
-                        # Pandoc sometimes emits tables inside lists as raw HTML
-                        raw_xml = self._handle_raw_block_in_list(content, para_pr_id=para_pr_id)
-                        if raw_xml:
-                            result.append(raw_xml)
-
-                    elif block_type == 'CodeBlock':
-                        result.append(self._handle_code_block(content))
-
-        return "\n".join(result)
-        """Process blocks that appear inside a list item (e.g. inside a Div).
-        Recursively handles nested lists and tables at any depth.
-        Para/Plain blocks are rendered with depth-appropriate indentation."""
-        result = []
-        para_pr_id = self._get_para_pr_for_list_depth(depth)
-
-        for block in blocks:
-            if not isinstance(block, dict):
-                continue
-            block_type = block.get('t')
-            content = block.get('c')
-
-            if block_type == 'Para':
-                xml = self._create_para_start(
-                    style_id=self.normal_style_id, para_pr_id=para_pr_id)
-                xml += self._process_inlines(content)
-                xml += '</hp:p>'
-                result.append(xml)
-            elif block_type == 'Plain':
-                xml = self._create_para_start(
-                    style_id=self.normal_style_id, para_pr_id=para_pr_id)
-                xml += self._process_inlines(content)
-                xml += '</hp:p>'
-                result.append(xml)
-            elif block_type == 'Header':
-                result.append(self._handle_header(content))
-            elif block_type == 'HorizontalRule':
-                result.append(self._handle_horizontal_rule())
-            elif block_type == 'BlockQuote':
-                result.append(self._handle_block_quote(content, para_pr_id=para_pr_id))
-            elif block_type == 'Table':
-                table_xml = self._handle_table(content, para_pr_id=para_pr_id)
-                if table_xml:
-                    result.append(table_xml)
-            elif block_type == 'BulletList':
-                result.append(self._handle_bullet_list(content, depth + 1))
-            elif block_type == 'OrderedList':
-                result.append(self._handle_ordered_list(content, depth + 1))
-            elif block_type == 'Div':
-                inner_blocks = content[1] if (content and len(content) > 1) else []
-                result.append(self._process_blocks_in_list(inner_blocks, depth))
-            elif block_type == 'RawBlock':
-                raw_xml = self._handle_raw_block_in_list(content, para_pr_id=para_pr_id)
-                if raw_xml:
-                    result.append(raw_xml)
-            elif block_type == 'CodeBlock':
-                result.append(self._handle_code_block(content))
-        return "\n".join(result)
-
-    def _handle_raw_block_in_list(self, content, para_pr_id=None):
-        """Handle RawBlock nodes that may contain HTML tables inside list items.
-
-        Pandoc sometimes cannot fully parse a table that is nested inside a list
-        and instead emits it as a RawBlock with format 'html'.  We detect that
-        case here, build a minimal Pandoc-style AST for the table using
-        html.parser, and delegate to the regular _handle_table path so the
-        output is identical to a natively parsed table.
-        """
-        if not content or len(content) < 2:
-            return ""
-
-        raw_format = content[0]
-        raw_html = content[1]
-
-        # Only attempt to handle HTML blocks that look like tables
-        if raw_format not in ('html', 'HTML'):
-            return ""
-        if '<table' not in raw_html.lower():
-            return ""
-
-        try:
-            return self._convert_raw_html_table(raw_html, para_pr_id=para_pr_id)
-        except Exception as e:
-            print(f"[Warn] Failed to convert raw HTML table: {e}", file=sys.stderr)
-            return ""
-
-    def _convert_raw_html_table(self, html_str, para_pr_id=None):
-        """Parse a raw HTML <table> string and convert it to HWPX XML.
-
-        Builds a minimal cell-grid directly from the HTML so that we can reuse
-        the existing _handle_table infrastructure (column-width calculation,
-        borderFill, subList generation, etc.) without duplicating logic.
-        para_pr_id: when set, applies the same indentation as the surrounding list.
-        """
-        from html.parser import HTMLParser as _HP
-
-        class _TableParser(_HP):
-            """Minimal SAX-style parser that extracts rows/cells from an HTML table."""
-            def __init__(self):
-                super().__init__()
-                self.rows = []          # list of rows; each row = list of cell dicts
-                self._cur_row = None
-                self._cur_cell = None   # {'is_header': bool, 'colspan': int, 'rowspan': int, 'text': str}
-                self._in_cell = False
-                self._text_buf = []
-                self._depth = 0         # nesting guard for nested tables
-
-            def handle_starttag(self, tag, attrs):
-                attrs_d = dict(attrs)
-                if tag == 'table':
-                    self._depth += 1
-                    return
-                if self._depth != 1:   # ignore nested tables
-                    return
-                if tag == 'tr':
-                    self._cur_row = []
-                elif tag in ('td', 'th'):
-                    self._in_cell = True
-                    self._text_buf = []
-                    self._cur_cell = {
-                        'is_header': tag == 'th',
-                        'colspan': int(attrs_d.get('colspan', 1)),
-                        'rowspan': int(attrs_d.get('rowspan', 1)),
-                        'text': ''
-                    }
-
-            def handle_endtag(self, tag):
-                if tag == 'table':
-                    self._depth -= 1
-                    return
-                if self._depth != 1:
-                    return
-                if tag in ('td', 'th'):
-                    if self._cur_cell is not None:
-                        self._cur_cell['text'] = ''.join(self._text_buf).strip()
-                        if self._cur_row is not None:
-                            self._cur_row.append(self._cur_cell)
-                    self._cur_cell = None
-                    self._in_cell = False
-                    self._text_buf = []
-                elif tag == 'tr':
-                    if self._cur_row is not None:
-                        self.rows.append(self._cur_row)
-                    self._cur_row = None
-
-            def handle_data(self, data):
-                if self._in_cell and self._depth == 1:
-                    self._text_buf.append(data)
-
-        parser = _TableParser()
-        parser.feed(html_str)
-        rows = parser.rows
-
-        if not rows:
-            return ""
-
-        # ---- Build the same cell_grid that _handle_table produces ----
-        cell_grid = {}
-        max_row = 0
-        max_col = 0
-
-        for row_idx, row in enumerate(rows):
-            curr_col = 0
-            for cell in row:
-                # skip occupied cells
-                while (row_idx, curr_col) in cell_grid:
-                    curr_col += 1
-
-                colspan = cell['colspan']
-                rowspan = cell['rowspan']
-                text = cell['text']
-
-                # Build a minimal Pandoc block list for the cell content
-                # so we can reuse _process_blocks_for_table_cell
-                if text:
-                    inline_block = {
-                        't': 'Para',
-                        'c': [{'t': 'Str', 'c': text}]
-                    }
-                else:
-                    inline_block = {'t': 'Para', 'c': []}
-
-                for r in range(rowspan):
-                    for c in range(colspan):
-                        cell_grid[(row_idx + r, curr_col + c)] = {
-                            'origin_row': row_idx,
-                            'origin_col': curr_col,
-                            'rowspan': rowspan,
-                            'colspan': colspan,
-                            'blocks': [inline_block]
-                        }
-
-                max_row = max(max_row, row_idx + rowspan - 1)
-                max_col = max(max_col, curr_col + colspan - 1)
-                curr_col += colspan
-
-        row_cnt = max_row + 1
-        col_cnt = max_col + 1
-
-        # ---- Re-use the XML-generation portion of _handle_table ----
-        TOTAL_TABLE_WIDTH = 45000
-
-        import time, random
-        tbl_id = str(int(time.time() * 1000) % 100000000 + random.randint(0, 10000))
-
-        xml_parts = []
-        effective_para_pr_id = para_pr_id if para_pr_id is not None else self.normal_para_pr_id
-        xml_parts.append(self._create_para_start(style_id=self.normal_style_id,
-                                                  para_pr_id=effective_para_pr_id))
-        xml_parts.append(self._create_run_start(char_pr_id=0))
-
-        if self.table_border_fill_id is None:
-            self._ensure_table_border_fill()
-
-        # paraPr left-margin already handles the list indent — horzOffset stays 0.
-        # Shrink width so the table doesn't overflow the right page margin.
-        para_left_margin = self._get_left_margin_from_para_pr(effective_para_pr_id)
-        effective_width = TOTAL_TABLE_WIDTH - para_left_margin
-        # Column widths are based on the effective (post-indent) table width
-        col_widths = [int(effective_width / col_cnt) for _ in range(col_cnt)]
-
-        xml_parts.append(
-            f'<hp:tbl id="{tbl_id}" zOrder="0" numberingType="TABLE" '
-            f'textWrap="TOP_AND_BOTTOM" textFlow="BOTH_SIDES" lock="0" '
-            f'dropcapstyle="None" pageBreak="CELL" repeatHeader="1" '
-            f'rowCnt="{row_cnt}" colCnt="{col_cnt}" cellSpacing="0" '
-            f'borderFillIDRef="{self.table_border_fill_id}" noAdjust="0">'
-        )
-        xml_parts.append(
-            f'<hp:sz width="{effective_width}" widthRelTo="ABSOLUTE" '
-            f'height="{row_cnt * 1000}" heightRelTo="ABSOLUTE" protect="0"/>'
-        )
-        xml_parts.append(
-            '<hp:pos treatAsChar="0" affectLSpacing="0" flowWithText="1" '
-            'allowOverlap="0" holdAnchorAndSO="0" vertRelTo="PARA" '
-            'horzRelTo="COLUMN" vertAlign="TOP" horzAlign="LEFT" '
-            'vertOffset="0" horzOffset="0"/>'
-        )
-        xml_parts.append('<hp:outMargin left="0" right="0" top="0" bottom="1417"/>')
-        xml_parts.append('<hp:inMargin left="510" right="510" top="141" bottom="141"/>')
-
-        processed_cells = set()
-        for row_idx in range(row_cnt):
-            xml_parts.append('<hp:tr>')
-            for col_idx in range(col_cnt):
-                if (row_idx, col_idx) not in cell_grid:
-                    continue
-                cell_info = cell_grid[(row_idx, col_idx)]
-                if cell_info['origin_row'] != row_idx or cell_info['origin_col'] != col_idx:
-                    continue
-                cell_key = (row_idx, col_idx)
-                if cell_key in processed_cells:
-                    continue
-                processed_cells.add(cell_key)
-
-                rowspan = cell_info['rowspan']
-                colspan = cell_info['colspan']
-                cell_blocks = cell_info['blocks']
-                cell_width = sum(col_widths[col_idx:col_idx + colspan])
-
-                sublist_id = str(
-                    int(time.time() * 100000) % 1000000000 + random.randint(0, 100000)
-                )
-                cell_content_xml = self._process_blocks_for_table_cell(cell_blocks)
-                if not cell_content_xml.strip():
-                    cell_content_xml = (
-                        self._create_para_start(style_id=self.normal_style_id,
-                                                para_pr_id=self.normal_para_pr_id)
-                        + '<hp:run charPrIDRef="0"><hp:t></hp:t></hp:run></hp:p>'
-                    )
-
-                xml_parts.append(
-                    f'<hp:tc name="" header="0" hasMargin="0" protect="0" '
-                    f'editable="0" dirty="0" borderFillIDRef="{self.table_border_fill_id}">'
-                )
-                xml_parts.append(
-                    f'<hp:subList id="{sublist_id}" textDirection="HORIZONTAL" '
-                    f'lineWrap="BREAK" vertAlign="TOP" linkListIDRef="0" '
-                    f'linkListNextIDRef="0" textWidth="0" textHeight="0" '
-                    f'hasTextRef="0" hasNumRef="0">'
-                )
-                xml_parts.append(cell_content_xml)
-                xml_parts.append('</hp:subList>')
-                xml_parts.append(f'<hp:cellAddr colAddr="{col_idx}" rowAddr="{row_idx}"/>')
-                xml_parts.append(f'<hp:cellSpan colSpan="{colspan}" rowSpan="{rowspan}"/>')
-                xml_parts.append(f'<hp:cellSz width="{cell_width}" height="1000"/>')
-                xml_parts.append('<hp:cellMargin left="510" right="510" top="141" bottom="141"/>')
-                xml_parts.append('</hp:tc>')
-
-            xml_parts.append('</hp:tr>')
-
-        xml_parts.append('</hp:tbl>')
-        xml_parts.append('</hp:run>')
-        xml_parts.append('</hp:p>')
-
-        return "".join(xml_parts)
-
-    def _handle_code_block(self, content):
-        """Handle code blocks (fenced code) as plain paragraphs."""
-        # content = [attr, code_text]
-        code_text = content[1] if len(content) > 1 else ''
-        xml = self._create_para_start(style_id=self.normal_style_id,
-                                      para_pr_id=self.normal_para_pr_id)
-        xml += f'<hp:run charPrIDRef="0"><hp:t>{self._escape_text(code_text)}</hp:t></hp:run>'
-        xml += '</hp:p>'
-        return xml
-
-    def _handle_horizontal_rule(self):
-        """Render a <hr> as an empty paragraph with a bottom border in header.xml.
-
-        We create a dedicated paraPr (cached) that has a solid bottom border,
-        which visually mimics a horizontal rule in HWP.
-        """
-        cache_key = '__horizontal_rule__'
-        if cache_key in self.para_pr_cache:
-            hr_para_pr_id = self.para_pr_cache[cache_key]
-        else:
-            hr_para_pr_id = self._create_hr_para_pr()
-            self.para_pr_cache[cache_key] = hr_para_pr_id
-
-        xml = self._create_para_start(style_id=self.normal_style_id, para_pr_id=hr_para_pr_id)
-        xml += '<hp:run charPrIDRef="0"><hp:t></hp:t></hp:run>'
-        xml += '</hp:p>'
-        return xml
-
-    def _create_hr_para_pr(self):
-        """Create a paraPr whose border-fill shows a solid bottom line (HR effect)."""
-        if self.header_root is None:
-            return str(self.normal_para_pr_id)
-
-        # First ensure a border-fill entry exists for the HR line
-        hr_bf_id = self._ensure_hr_border_fill()
-
-        base_node = self.header_root.find(
-            f'.//hh:paraPr[@id="{self.normal_para_pr_id}"]', self.namespaces)
-        if base_node is None:
-            base_node = self.header_root.find('.//hh:paraPr[@id="0"]', self.namespaces)
-        if base_node is None:
-            return str(self.normal_para_pr_id)
-
-        new_node = copy.deepcopy(base_node)
-        self.max_para_pr_id += 1
-        new_id = str(self.max_para_pr_id)
-        new_node.set('id', new_id)
-
-        HH = 'http://www.hancom.co.kr/hwpml/2011/head'
-        # Set borderFillIDRef on the paraPr itself
-        new_node.set('borderFillIDRef', str(hr_bf_id))
-
-        para_props = self.header_root.find('.//hh:paraProperties', self.namespaces)
-        if para_props is not None:
-            para_props.append(new_node)
-
-        return new_id
-
-    def _ensure_hr_border_fill(self):
-        """Create/return a borderFill that has only a solid bottom border (HR line)."""
-        if hasattr(self, '_hr_border_fill_id') and self._hr_border_fill_id is not None:
-            return self._hr_border_fill_id
-
-        self.max_border_fill_id += 1
-        bf_id = self.max_border_fill_id
-        self._hr_border_fill_id = bf_id
-
-        border_fill_xml = (
-            f'<hh:borderFill xmlns:hh="http://www.hancom.co.kr/hwpml/2011/head" '
-            f'xmlns:hc="http://www.hancom.co.kr/hwpml/2011/core" '
-            f'id="{bf_id}" threeD="0" shadow="0" slash="NONE" backSlash="NONE" '
-            f'crookedSlash="0" counterstrike="0">'
-            f'<hh:leftBorder type="NONE" width="0.12 mm" color="#000000"/>'
-            f'<hh:rightBorder type="NONE" width="0.12 mm" color="#000000"/>'
-            f'<hh:topBorder type="NONE" width="0.12 mm" color="#000000"/>'
-            f'<hh:bottomBorder type="SOLID" width="0.12 mm" color="#A0A0A0"/>'
-            f'<hh:diagonal type="NONE" crooked="0"/>'
-            f'<hc:fill><hc:fillColorPattern type="NONE" foreColor="#FFFFFF" backColor="#FFFFFF"/></hc:fill>'
-            f'</hh:borderFill>'
-        )
-        bf_elem = ET.fromstring(border_fill_xml)
-        bf_container = self.header_root.find('.//hh:borderFills', self.namespaces)
-        if bf_container is None:
-            bf_container = ET.SubElement(
-                self.header_root, '{http://www.hancom.co.kr/hwpml/2011/head}borderFills')
-        bf_container.append(bf_elem)
-        return bf_id
-
-    def _handle_block_quote(self, content, para_pr_id=None):
-        """Render a BlockQuote as indented paragraphs.
-
-        content is a list of blocks (same structure as a list item).
-        para_pr_id: when called from inside a list, the caller's depth paraPr
-                    is passed so indentation stacks correctly.
-        """
-        # BlockQuote gets one extra indent level beyond any surrounding list
-        # Use a fixed left-margin of 3600 HWPUNIT relative to whatever para_pr_id
-        # the caller is already using.
-        BQ_EXTRA_INDENT = 3600  # ~1.27 cm
-
-        if para_pr_id is not None:
-            base_margin = self._get_left_margin_from_para_pr(para_pr_id)
-        else:
-            base_margin = 0
-
-        bq_left_margin = base_margin + BQ_EXTRA_INDENT
-
-        # Get/create a paraPr for this exact left-margin
-        cache_key = (bq_left_margin, 0)
-        if cache_key in self.para_pr_cache:
-            bq_para_pr_id = self.para_pr_cache[cache_key]
-        else:
-            # Reuse _get_para_pr_for_list_depth logic but with an explicit margin
-            bq_para_pr_id = self._create_para_pr_with_margin(bq_left_margin)
-            self.para_pr_cache[cache_key] = bq_para_pr_id
-
-        result = []
-        for block in (content or []):
-            if not isinstance(block, dict):
-                continue
-            bt = block.get('t')
-            bc = block.get('c')
-            if bt in ('Para', 'Plain'):
-                xml = self._create_para_start(
-                    style_id=self.normal_style_id, para_pr_id=bq_para_pr_id)
-                xml += self._process_inlines(bc)
-                xml += '</hp:p>'
-                result.append(xml)
-            elif bt == 'Header':
-                result.append(self._handle_header(bc))
-            elif bt == 'BulletList':
-                result.append(self._handle_bullet_list(bc))
-            elif bt == 'OrderedList':
-                result.append(self._handle_ordered_list(bc))
-            elif bt == 'Table':
-                result.append(self._handle_table(bc, para_pr_id=bq_para_pr_id))
-            elif bt == 'HorizontalRule':
-                result.append(self._handle_horizontal_rule())
-            elif bt == 'BlockQuote':
-                result.append(self._handle_block_quote(bc, para_pr_id=bq_para_pr_id))
-            elif bt == 'CodeBlock':
-                result.append(self._handle_code_block(bc))
-        return "\n".join(result)
-
     def _create_para_pr_with_margin(self, left_margin_hwpunit):
-        """Create a new paraPr with the given left margin in HWPUNIT. Returns the new id string."""
+        """Clone the base paraPr and set left-margin to left_margin_hwpunit."""
         if self.header_root is None:
             return str(self.normal_para_pr_id)
 
@@ -1725,237 +541,862 @@ class PandocToHwpx:
         para_props = self.header_root.find('.//hh:paraProperties', self.namespaces)
         if para_props is not None:
             para_props.append(new_node)
-
         return new_id
 
-    def _process_blocks(self, blocks):
-        """Process Pandoc block elements"""
+    # ------------------------------------------------------------------ utils
+
+    def _escape_text(self, text):
+        return saxutils.escape(text)
+
+    def _create_para_start(self, style_id=0, para_pr_id=1, column_break=0, merged=0):
+        return (f'<hp:p paraPrIDRef="{para_pr_id}" styleIDRef="{style_id}" '
+                f'pageBreak="0" columnBreak="{column_break}" merged="{merged}">')
+
+    def _create_run_start(self, char_pr_id=0):
+        return f'<hp:run charPrIDRef="{char_pr_id}">'
+
+    def _create_text_run(self, text, char_pr_id=0):
+        return f'{self._create_run_start(char_pr_id)}<hp:t>{self._escape_text(text)}</hp:t></hp:run>'
+
+    # ------------------------------------------------------------------ table
+
+    def _handle_table(self, content, para_pr_id=None):
+        """Convert a Pandoc Table AST node to HWPX XML.
+
+        para_pr_id: when supplied (e.g. from a list), the wrapping paragraph
+        uses that paraPr so indentation matches the surrounding list text.
+        Table width is reduced by the same indent so it stays within the column.
+        horzOffset is always 0 — the paraPr left-margin already handles position.
+        """
+        table_head = content[3]
+        table_bodies = content[4]
+        table_foot = content[5]
+
+        all_rows = []
+        for row in table_head[1]:
+            all_rows.append(row)
+        for body in table_bodies:
+            for row in body[2]:
+                all_rows.append(row)
+            for row in body[3]:
+                all_rows.append(row)
+        for row in table_foot[1]:
+            all_rows.append(row)
+
+        if not all_rows:
+            return ""
+
+        cell_grid = {}
+        max_row = 0
+        max_col = 0
+        for row_idx, row in enumerate(all_rows):
+            curr_col = 0
+            for cell in row[1]:
+                while (row_idx, curr_col) in cell_grid:
+                    curr_col += 1
+                rowspan = cell[2]
+                colspan = cell[3]
+                for r in range(rowspan):
+                    for c in range(colspan):
+                        cell_grid[(row_idx + r, curr_col + c)] = {
+                            'origin_row': row_idx,
+                            'origin_col': curr_col,
+                            'rowspan': rowspan,
+                            'colspan': colspan,
+                            'blocks': cell[4]
+                        }
+                max_row = max(max_row, row_idx + rowspan - 1)
+                max_col = max(max_col, curr_col + colspan - 1)
+                curr_col += colspan
+
+        row_cnt = max_row + 1
+        col_cnt = max_col + 1
+        TOTAL_TABLE_WIDTH = 45000
+
+        import time, random
+        tbl_id = str(int(time.time() * 1000) % 100000000 + random.randint(0, 10000))
+
+        effective_para_pr_id = para_pr_id if para_pr_id is not None else self.normal_para_pr_id
+
+        xml_parts = []
+        xml_parts.append(self._create_para_start(
+            style_id=self.normal_style_id, para_pr_id=effective_para_pr_id))
+        xml_parts.append(self._create_run_start(char_pr_id=0))
+
+        if self.table_border_fill_id is None:
+            self._ensure_table_border_fill()
+
+        # Width shrinks by the left-margin so table stays within the column.
+        para_left_margin = self._get_left_margin_from_para_pr(effective_para_pr_id)
+        effective_width = TOTAL_TABLE_WIDTH - para_left_margin
+        col_widths = [int(effective_width / col_cnt) for _ in range(col_cnt)]
+
+        xml_parts.append(
+            f'<hp:tbl id="{tbl_id}" zOrder="0" numberingType="TABLE" '
+            f'textWrap="TOP_AND_BOTTOM" textFlow="BOTH_SIDES" lock="0" '
+            f'dropcapstyle="None" pageBreak="CELL" repeatHeader="1" '
+            f'rowCnt="{row_cnt}" colCnt="{col_cnt}" cellSpacing="0" '
+            f'borderFillIDRef="{self.table_border_fill_id}" noAdjust="0">')
+        xml_parts.append(
+            f'<hp:sz width="{effective_width}" widthRelTo="ABSOLUTE" '
+            f'height="{row_cnt * 1000}" heightRelTo="ABSOLUTE" protect="0"/>')
+        xml_parts.append(
+            '<hp:pos treatAsChar="0" affectLSpacing="0" flowWithText="1" '
+            'allowOverlap="0" holdAnchorAndSO="0" vertRelTo="PARA" '
+            'horzRelTo="PARA" vertAlign="TOP" horzAlign="LEFT" '
+            'vertOffset="0" horzOffset="0"/>')
+        xml_parts.append('<hp:outMargin left="0" right="0" top="0" bottom="1417"/>')
+        xml_parts.append('<hp:inMargin left="510" right="510" top="141" bottom="141"/>')
+
+        processed_cells = set()
+        for row_idx in range(row_cnt):
+            xml_parts.append('<hp:tr>')
+            for col_idx in range(col_cnt):
+                if (row_idx, col_idx) not in cell_grid:
+                    continue
+                ci = cell_grid[(row_idx, col_idx)]
+                if ci['origin_row'] != row_idx or ci['origin_col'] != col_idx:
+                    continue
+                cell_key = (row_idx, col_idx)
+                if cell_key in processed_cells:
+                    continue
+                processed_cells.add(cell_key)
+
+                rowspan = ci['rowspan']
+                colspan = ci['colspan']
+                cell_width = sum(col_widths[col_idx:col_idx + colspan])
+                sublist_id = str(
+                    int(time.time() * 100000) % 1000000000 + random.randint(0, 100000))
+
+                cell_xml = self._process_blocks_for_table_cell(ci['blocks'])
+                if not cell_xml.strip():
+                    cell_xml = (
+                        self._create_para_start(
+                            style_id=self.normal_style_id, para_pr_id=self.normal_para_pr_id)
+                        + '<hp:run charPrIDRef="0"><hp:t></hp:t></hp:run></hp:p>')
+
+                xml_parts.append(
+                    f'<hp:tc name="" header="0" hasMargin="0" protect="0" '
+                    f'editable="0" dirty="0" borderFillIDRef="{self.table_border_fill_id}">')
+                xml_parts.append(
+                    f'<hp:subList id="{sublist_id}" textDirection="HORIZONTAL" '
+                    f'lineWrap="BREAK" vertAlign="TOP" linkListIDRef="0" '
+                    f'linkListNextIDRef="0" textWidth="0" textHeight="0" '
+                    f'hasTextRef="0" hasNumRef="0">')
+                xml_parts.append(cell_xml)
+                xml_parts.append('</hp:subList>')
+                xml_parts.append(f'<hp:cellAddr colAddr="{col_idx}" rowAddr="{row_idx}"/>')
+                xml_parts.append(f'<hp:cellSpan colSpan="{colspan}" rowSpan="{rowspan}"/>')
+                xml_parts.append(f'<hp:cellSz width="{cell_width}" height="1000"/>')
+                xml_parts.append('<hp:cellMargin left="510" right="510" top="141" bottom="141"/>')
+                xml_parts.append('</hp:tc>')
+            xml_parts.append('</hp:tr>')
+
+        xml_parts.append('</hp:tbl>')
+        xml_parts.append('</hp:run>')
+        xml_parts.append('</hp:p>')
+        return "".join(xml_parts)
+
+    def _ensure_table_border_fill(self):
+        if self.table_border_fill_id is not None:
+            return self.table_border_fill_id
+        self.max_border_fill_id += 1
+        self.table_border_fill_id = self.max_border_fill_id
+        if self.header_root is None:
+            return self.table_border_fill_id
+        bf_xml = (
+            f'<hh:borderFill xmlns:hh="http://www.hancom.co.kr/hwpml/2011/head" '
+            f'xmlns:hc="http://www.hancom.co.kr/hwpml/2011/core" '
+            f'id="{self.table_border_fill_id}" threeD="0" shadow="0" slash="NONE" '
+            f'backSlash="NONE" crookedSlash="0" counterstrike="0">'
+            f'<hh:leftBorder type="SOLID" width="0.12 mm" color="#000000"/>'
+            f'<hh:rightBorder type="SOLID" width="0.12 mm" color="#000000"/>'
+            f'<hh:topBorder type="SOLID" width="0.12 mm" color="#000000"/>'
+            f'<hh:bottomBorder type="SOLID" width="0.12 mm" color="#000000"/>'
+            f'<hh:diagonal type="NONE" crooked="0"/>'
+            f'<hc:fill><hc:fillColorPattern type="NONE" foreColor="#FFFFFF" '
+            f'backColor="#FFFFFF"/></hc:fill></hh:borderFill>'
+        )
+        bf_elem = ET.fromstring(bf_xml)
+        bfc = self.header_root.find('.//hh:borderFills', self.namespaces)
+        if bfc is None:
+            bfc = ET.SubElement(
+                self.header_root, '{http://www.hancom.co.kr/hwpml/2011/head}borderFills')
+        bfc.append(bf_elem)
+        return self.table_border_fill_id
+
+    # ------------------------------------------------------------------ table cell
+
+    def _process_blocks_for_table_cell(self, blocks):
         result = []
         for block in blocks:
             if not isinstance(block, dict):
                 continue
-
-            block_type = block.get('t')
-            content = block.get('c')
-
-            if block_type == 'Para':
-                result.append(self._handle_para(content))
-
-            elif block_type == 'Plain':
-                result.append(self._handle_plain(content))
-
-            elif block_type == 'Header':
-                result.append(self._handle_header(content))
-
-            elif block_type == 'BulletList':
-                result.append(self._handle_bullet_list(content))
-
-            elif block_type == 'OrderedList':
-                result.append(self._handle_ordered_list(content))
-
-            elif block_type == 'Table':
-                table_xml = self._handle_table(content)
-                if table_xml:
-                    result.append(table_xml)
-
-            elif block_type == 'Div':
-                # Unwrap div and process its inner blocks
-                inner_blocks = content[1] if (content and len(content) > 1) else []
-                result.append(self._process_blocks(inner_blocks))
-
-            elif block_type == 'CodeBlock':
-                result.append(self._handle_code_block(content))
-
-            elif block_type == 'HorizontalRule':
+            bt = block.get('t')
+            bc = block.get('c')
+            if bt == 'Para':
+                result.append(self._handle_para_in_table(bc))
+            elif bt == 'Plain':
+                result.append(self._handle_plain_in_table(bc))
+            elif bt == 'Header':
+                result.append(self._handle_header(bc))
+            elif bt == 'BulletList':
+                result.append(self._handle_bullet_list(bc))
+            elif bt == 'OrderedList':
+                result.append(self._handle_ordered_list(bc))
+            elif bt == 'Table':
+                xml = self._handle_table(bc)
+                if xml:
+                    result.append(xml)
+            elif bt == 'HorizontalRule':
                 result.append(self._handle_horizontal_rule())
+            elif bt == 'BlockQuote':
+                result.append(self._handle_block_quote(bc))
+        return "\n".join(result)
 
-            elif block_type == 'BlockQuote':
-                result.append(self._handle_block_quote(content))
+    def _handle_para_in_table(self, content):
+        segments = self._split_by_linebreak(content)
+        result = []
+        for seg in segments:
+            if seg:
+                xml = self._create_para_start(
+                    style_id=self.normal_style_id, para_pr_id=self.normal_para_pr_id)
+                xml += self._process_inlines(seg) + '</hp:p>'
+                result.append(xml)
+        if not result:
+            result.append(
+                self._create_para_start(
+                    style_id=self.normal_style_id, para_pr_id=self.normal_para_pr_id)
+                + '<hp:run charPrIDRef="0"><hp:t></hp:t></hp:run></hp:p>')
+        return "\n".join(result)
 
-            elif block_type == 'RawBlock':
-                raw_xml = self._handle_raw_block_in_list(content)
-                if raw_xml:
-                    result.append(raw_xml)
+    def _handle_plain_in_table(self, content):
+        return self._handle_para_in_table(content)
+
+    def _split_by_linebreak(self, inlines):
+        segments = []
+        current = []
+        for inline in inlines:
+            if inline.get('t') == 'LineBreak':
+                segments.append(current)
+                current = []
+            else:
+                current.append(inline)
+        if current:
+            segments.append(current)
+        return segments
+
+    # ------------------------------------------------------------------ paragraphs
+
+    def _handle_para(self, content, para_styles=None):
+        if para_styles is None and self.html_para_styles:
+            para_text = self._get_plain_text(content)[:100]
+            if para_text in self.html_para_styles:
+                hs = self.html_para_styles[para_text]
+                para_styles = {
+                    k: self._convert_size_to_hwp(v)
+                    for k, v in hs.items()
+                }
+        padding_left = 0
+        text_indent = 0
+        if para_styles:
+            padding_left = para_styles.get('padding-left', 0) or para_styles.get('margin-left', 0)
+            text_indent = para_styles.get('text-indent', 0)
+        para_pr_id = self._get_or_create_para_pr(padding_left, text_indent)
+        return (self._create_para_start(style_id=self.normal_style_id, para_pr_id=para_pr_id)
+                + self._process_inlines(content) + '</hp:p>')
+
+    def _handle_plain(self, content, para_styles=None):
+        return self._handle_para(content, para_styles)
+
+    def _handle_header(self, content):
+        level = content[0]
+        inlines = content[2]
+        style = min(level, 6)
+        return (self._create_para_start(style_id=style)
+                + self._process_inlines(inlines) + '</hp:p>')
+
+    # ------------------------------------------------------------------ lists
+
+    def _handle_bullet_list(self, list_data, depth=0):
+        """Handle bullet lists with indentation and all block types per item."""
+        items = list_data if isinstance(list_data, list) else []
+        result = []
+        para_pr_id = self._get_para_pr_for_list_depth(depth)
+
+        for item in items:
+            if not isinstance(item, list):
+                continue
+            has_text_block = False
+            for block in item:
+                bt = block.get('t')
+                bc = block.get('c')
+
+                if bt in ('Plain', 'Para'):
+                    result.append(self._create_para_start(
+                        style_id=self.normal_style_id, para_pr_id=para_pr_id))
+                    if not has_text_block:
+                        result.append('<hp:run charPrIDRef="0"><hp:t>• </hp:t></hp:run>')
+                        has_text_block = True
+                    result.append(self._process_inlines(bc))
+                    result.append('</hp:p>')
+                elif bt == 'BulletList':
+                    result.append(self._handle_bullet_list(bc, depth + 1))
+                elif bt == 'OrderedList':
+                    result.append(self._handle_ordered_list(bc, depth + 1))
+                elif bt == 'Header':
+                    result.append(self._handle_header(bc))
+                elif bt == 'HorizontalRule':
+                    result.append(self._handle_horizontal_rule())
+                elif bt == 'BlockQuote':
+                    result.append(self._handle_block_quote(bc, para_pr_id=para_pr_id))
+                elif bt == 'Table':
+                    xml = self._handle_table(bc, para_pr_id=para_pr_id)
+                    if xml:
+                        result.append(xml)
+                elif bt == 'Div':
+                    div_blocks = bc[1] if (bc and len(bc) > 1) else []
+                    result.append(self._process_blocks_in_list(div_blocks, depth))
+                elif bt == 'RawBlock':
+                    xml = self._handle_raw_block_in_list(bc, para_pr_id=para_pr_id)
+                    if xml:
+                        result.append(xml)
+                elif bt == 'CodeBlock':
+                    result.append(self._handle_code_block(bc))
+
+        return "\n".join(result)
+
+    def _handle_ordered_list(self, list_data, depth=0):
+        """Handle ordered lists with indentation and all block types per item."""
+        items = list_data[1] if len(list_data) > 1 else []
+        result = []
+        para_pr_id = self._get_para_pr_for_list_depth(depth)
+
+        for idx, item in enumerate(items, 1):
+            if not isinstance(item, list):
+                continue
+            has_text_block = False
+            for block in item:
+                bt = block.get('t')
+                bc = block.get('c')
+
+                if bt in ('Plain', 'Para'):
+                    result.append(self._create_para_start(
+                        style_id=self.normal_style_id, para_pr_id=para_pr_id))
+                    if not has_text_block:
+                        result.append(
+                            f'<hp:run charPrIDRef="0"><hp:t>{idx}. </hp:t></hp:run>')
+                        has_text_block = True
+                    result.append(self._process_inlines(bc))
+                    result.append('</hp:p>')
+                elif bt == 'BulletList':
+                    result.append(self._handle_bullet_list(bc, depth + 1))
+                elif bt == 'OrderedList':
+                    result.append(self._handle_ordered_list(bc, depth + 1))
+                elif bt == 'Header':
+                    result.append(self._handle_header(bc))
+                elif bt == 'HorizontalRule':
+                    result.append(self._handle_horizontal_rule())
+                elif bt == 'BlockQuote':
+                    result.append(self._handle_block_quote(bc, para_pr_id=para_pr_id))
+                elif bt == 'Table':
+                    xml = self._handle_table(bc, para_pr_id=para_pr_id)
+                    if xml:
+                        result.append(xml)
+                elif bt == 'Div':
+                    div_blocks = bc[1] if (bc and len(bc) > 1) else []
+                    result.append(self._process_blocks_in_list(div_blocks, depth))
+                elif bt == 'RawBlock':
+                    xml = self._handle_raw_block_in_list(bc, para_pr_id=para_pr_id)
+                    if xml:
+                        result.append(xml)
+                elif bt == 'CodeBlock':
+                    result.append(self._handle_code_block(bc))
+
+        return "\n".join(result)
+
+    def _process_blocks_in_list(self, blocks, depth=0):
+        """Process blocks inside a list item (e.g. wrapped in a Div).
+
+        Para/Plain blocks use depth-appropriate indentation.
+        Tables pass para_pr_id so they are also correctly indented.
+        """
+        result = []
+        para_pr_id = self._get_para_pr_for_list_depth(depth)
+
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+            bt = block.get('t')
+            bc = block.get('c')
+
+            if bt in ('Para', 'Plain'):
+                xml = (self._create_para_start(
+                            style_id=self.normal_style_id, para_pr_id=para_pr_id)
+                       + self._process_inlines(bc) + '</hp:p>')
+                result.append(xml)
+            elif bt == 'Header':
+                result.append(self._handle_header(bc))
+            elif bt == 'HorizontalRule':
+                result.append(self._handle_horizontal_rule())
+            elif bt == 'BlockQuote':
+                result.append(self._handle_block_quote(bc, para_pr_id=para_pr_id))
+            elif bt == 'Table':
+                xml = self._handle_table(bc, para_pr_id=para_pr_id)
+                if xml:
+                    result.append(xml)
+            elif bt == 'BulletList':
+                result.append(self._handle_bullet_list(bc, depth + 1))
+            elif bt == 'OrderedList':
+                result.append(self._handle_ordered_list(bc, depth + 1))
+            elif bt == 'Div':
+                inner = bc[1] if (bc and len(bc) > 1) else []
+                result.append(self._process_blocks_in_list(inner, depth))
+            elif bt == 'RawBlock':
+                xml = self._handle_raw_block_in_list(bc, para_pr_id=para_pr_id)
+                if xml:
+                    result.append(xml)
+            elif bt == 'CodeBlock':
+                result.append(self._handle_code_block(bc))
+
+        return "\n".join(result)
+
+    # ------------------------------------------------------------------ raw / code
+
+    def _handle_raw_block_in_list(self, content, para_pr_id=None):
+        if not content or len(content) < 2:
+            return ""
+        raw_format, raw_html = content[0], content[1]
+        if raw_format not in ('html', 'HTML'):
+            return ""
+        if '<table' not in raw_html.lower():
+            return ""
+        try:
+            return self._convert_raw_html_table(raw_html, para_pr_id=para_pr_id)
+        except Exception as e:
+            print(f"[Warn] Failed to convert raw HTML table: {e}", file=sys.stderr)
+            return ""
+
+    def _convert_raw_html_table(self, html_str, para_pr_id=None):
+        """Parse a raw HTML <table> and emit HWPX XML reusing _handle_table logic."""
+        from html.parser import HTMLParser as _HP
+
+        class _TP(_HP):
+            def __init__(self):
+                super().__init__()
+                self.rows = []
+                self._row = None
+                self._cell = None
+                self._buf = []
+                self._depth = 0
+
+            def handle_starttag(self, tag, attrs):
+                ad = dict(attrs)
+                if tag == 'table':
+                    self._depth += 1
+                    return
+                if self._depth != 1:
+                    return
+                if tag == 'tr':
+                    self._row = []
+                elif tag in ('td', 'th'):
+                    self._buf = []
+                    self._cell = {
+                        'is_header': tag == 'th',
+                        'colspan': int(ad.get('colspan', 1)),
+                        'rowspan': int(ad.get('rowspan', 1)),
+                        'text': ''
+                    }
+
+            def handle_endtag(self, tag):
+                if tag == 'table':
+                    self._depth -= 1
+                    return
+                if self._depth != 1:
+                    return
+                if tag in ('td', 'th'):
+                    if self._cell is not None:
+                        self._cell['text'] = ''.join(self._buf).strip()
+                        if self._row is not None:
+                            self._row.append(self._cell)
+                    self._cell = None
+                    self._buf = []
+                elif tag == 'tr':
+                    if self._row is not None:
+                        self.rows.append(self._row)
+                    self._row = None
+
+            def handle_data(self, data):
+                if self._cell is not None and self._depth == 1:
+                    self._buf.append(data)
+
+        parser = _TP()
+        parser.feed(html_str)
+        rows = parser.rows
+        if not rows:
+            return ""
+
+        cell_grid = {}
+        max_row = max_col = 0
+        for row_idx, row in enumerate(rows):
+            curr_col = 0
+            for cell in row:
+                while (row_idx, curr_col) in cell_grid:
+                    curr_col += 1
+                colspan = cell['colspan']
+                rowspan = cell['rowspan']
+                ib = ({'t': 'Para', 'c': [{'t': 'Str', 'c': cell['text']}]}
+                      if cell['text'] else {'t': 'Para', 'c': []})
+                for r in range(rowspan):
+                    for c in range(colspan):
+                        cell_grid[(row_idx + r, curr_col + c)] = {
+                            'origin_row': row_idx, 'origin_col': curr_col,
+                            'rowspan': rowspan, 'colspan': colspan, 'blocks': [ib]
+                        }
+                max_row = max(max_row, row_idx + rowspan - 1)
+                max_col = max(max_col, curr_col + colspan - 1)
+                curr_col += colspan
+
+        row_cnt = max_row + 1
+        col_cnt = max_col + 1
+        TOTAL_TABLE_WIDTH = 45000
+
+        import time, random
+        tbl_id = str(int(time.time() * 1000) % 100000000 + random.randint(0, 10000))
+
+        eppid = para_pr_id if para_pr_id is not None else self.normal_para_pr_id
+        xml_parts = [
+            self._create_para_start(style_id=self.normal_style_id, para_pr_id=eppid),
+            self._create_run_start(char_pr_id=0),
+        ]
+
+        if self.table_border_fill_id is None:
+            self._ensure_table_border_fill()
+
+        plm = self._get_left_margin_from_para_pr(eppid)
+        ew = TOTAL_TABLE_WIDTH - plm
+        col_widths = [int(ew / col_cnt) for _ in range(col_cnt)]
+
+        xml_parts.append(
+            f'<hp:tbl id="{tbl_id}" zOrder="0" numberingType="TABLE" '
+            f'textWrap="TOP_AND_BOTTOM" textFlow="BOTH_SIDES" lock="0" '
+            f'dropcapstyle="None" pageBreak="CELL" repeatHeader="1" '
+            f'rowCnt="{row_cnt}" colCnt="{col_cnt}" cellSpacing="0" '
+            f'borderFillIDRef="{self.table_border_fill_id}" noAdjust="0">')
+        xml_parts.append(
+            f'<hp:sz width="{ew}" widthRelTo="ABSOLUTE" '
+            f'height="{row_cnt * 1000}" heightRelTo="ABSOLUTE" protect="0"/>')
+        xml_parts.append(
+            '<hp:pos treatAsChar="0" affectLSpacing="0" flowWithText="1" '
+            'allowOverlap="0" holdAnchorAndSO="0" vertRelTo="PARA" '
+            'horzRelTo="PARA" vertAlign="TOP" horzAlign="LEFT" '
+            'vertOffset="0" horzOffset="0"/>')
+        xml_parts.append('<hp:outMargin left="0" right="0" top="0" bottom="1417"/>')
+        xml_parts.append('<hp:inMargin left="510" right="510" top="141" bottom="141"/>')
+
+        processed = set()
+        for row_idx in range(row_cnt):
+            xml_parts.append('<hp:tr>')
+            for col_idx in range(col_cnt):
+                if (row_idx, col_idx) not in cell_grid:
+                    continue
+                ci = cell_grid[(row_idx, col_idx)]
+                if ci['origin_row'] != row_idx or ci['origin_col'] != col_idx:
+                    continue
+                if (row_idx, col_idx) in processed:
+                    continue
+                processed.add((row_idx, col_idx))
+                cw = sum(col_widths[col_idx:col_idx + ci['colspan']])
+                sid = str(int(time.time() * 100000) % 1000000000 + random.randint(0, 100000))
+                cxml = self._process_blocks_for_table_cell(ci['blocks'])
+                if not cxml.strip():
+                    cxml = (
+                        self._create_para_start(
+                            style_id=self.normal_style_id,
+                            para_pr_id=self.normal_para_pr_id)
+                        + '<hp:run charPrIDRef="0"><hp:t></hp:t></hp:run></hp:p>')
+                xml_parts.append(
+                    f'<hp:tc name="" header="0" hasMargin="0" protect="0" '
+                    f'editable="0" dirty="0" borderFillIDRef="{self.table_border_fill_id}">')
+                xml_parts.append(
+                    f'<hp:subList id="{sid}" textDirection="HORIZONTAL" lineWrap="BREAK" '
+                    f'vertAlign="TOP" linkListIDRef="0" linkListNextIDRef="0" '
+                    f'textWidth="0" textHeight="0" hasTextRef="0" hasNumRef="0">')
+                xml_parts.append(cxml)
+                xml_parts.append('</hp:subList>')
+                xml_parts.append(f'<hp:cellAddr colAddr="{col_idx}" rowAddr="{row_idx}"/>')
+                xml_parts.append(
+                    f'<hp:cellSpan colSpan="{ci["colspan"]}" rowSpan="{ci["rowspan"]}"/>')
+                xml_parts.append(f'<hp:cellSz width="{cw}" height="1000"/>')
+                xml_parts.append('<hp:cellMargin left="510" right="510" top="141" bottom="141"/>')
+                xml_parts.append('</hp:tc>')
+            xml_parts.append('</hp:tr>')
+
+        xml_parts += ['</hp:tbl>', '</hp:run>', '</hp:p>']
+        return "".join(xml_parts)
+
+    def _handle_code_block(self, content):
+        code_text = content[1] if len(content) > 1 else ''
+        return (self._create_para_start(
+                    style_id=self.normal_style_id, para_pr_id=self.normal_para_pr_id)
+                + f'<hp:run charPrIDRef="0"><hp:t>{self._escape_text(code_text)}</hp:t></hp:run>'
+                + '</hp:p>')
+
+    # ------------------------------------------------------------------ HR / blockquote
+
+    def _handle_horizontal_rule(self):
+        """Render <hr> as an empty paragraph with a bottom border."""
+        cache_key = '__horizontal_rule__'
+        if cache_key in self.para_pr_cache:
+            hr_id = self.para_pr_cache[cache_key]
+        else:
+            hr_id = self._create_hr_para_pr()
+            self.para_pr_cache[cache_key] = hr_id
+        return (self._create_para_start(style_id=self.normal_style_id, para_pr_id=hr_id)
+                + '<hp:run charPrIDRef="0"><hp:t></hp:t></hp:run></hp:p>')
+
+    def _create_hr_para_pr(self):
+        if self.header_root is None:
+            return str(self.normal_para_pr_id)
+        hr_bf_id = self._ensure_hr_border_fill()
+        base_node = self.header_root.find(
+            f'.//hh:paraPr[@id="{self.normal_para_pr_id}"]', self.namespaces)
+        if base_node is None:
+            base_node = self.header_root.find('.//hh:paraPr[@id="0"]', self.namespaces)
+        if base_node is None:
+            return str(self.normal_para_pr_id)
+        new_node = copy.deepcopy(base_node)
+        self.max_para_pr_id += 1
+        new_id = str(self.max_para_pr_id)
+        new_node.set('id', new_id)
+        new_node.set('borderFillIDRef', str(hr_bf_id))
+        para_props = self.header_root.find('.//hh:paraProperties', self.namespaces)
+        if para_props is not None:
+            para_props.append(new_node)
+        return new_id
+
+    def _ensure_hr_border_fill(self):
+        if hasattr(self, '_hr_border_fill_id') and self._hr_border_fill_id is not None:
+            return self._hr_border_fill_id
+        self.max_border_fill_id += 1
+        bf_id = self.max_border_fill_id
+        self._hr_border_fill_id = bf_id
+        bf_xml = (
+            f'<hh:borderFill xmlns:hh="http://www.hancom.co.kr/hwpml/2011/head" '
+            f'xmlns:hc="http://www.hancom.co.kr/hwpml/2011/core" '
+            f'id="{bf_id}" threeD="0" shadow="0" slash="NONE" backSlash="NONE" '
+            f'crookedSlash="0" counterstrike="0">'
+            f'<hh:leftBorder type="NONE" width="0.12 mm" color="#000000"/>'
+            f'<hh:rightBorder type="NONE" width="0.12 mm" color="#000000"/>'
+            f'<hh:topBorder type="NONE" width="0.12 mm" color="#000000"/>'
+            f'<hh:bottomBorder type="SOLID" width="0.12 mm" color="#A0A0A0"/>'
+            f'<hh:diagonal type="NONE" crooked="0"/>'
+            f'<hc:fill><hc:fillColorPattern type="NONE" foreColor="#FFFFFF" '
+            f'backColor="#FFFFFF"/></hc:fill></hh:borderFill>'
+        )
+        bf_elem = ET.fromstring(bf_xml)
+        bfc = self.header_root.find('.//hh:borderFills', self.namespaces)
+        if bfc is None:
+            bfc = ET.SubElement(
+                self.header_root, '{http://www.hancom.co.kr/hwpml/2011/head}borderFills')
+        bfc.append(bf_elem)
+        return bf_id
+
+    def _handle_block_quote(self, content, para_pr_id=None):
+        """Render BlockQuote as indented paragraphs (one extra indent level)."""
+        BQ_EXTRA = 3600
+        base_margin = self._get_left_margin_from_para_pr(para_pr_id) if para_pr_id else 0
+        bq_margin = base_margin + BQ_EXTRA
+        cache_key = (bq_margin, 0)
+        if cache_key in self.para_pr_cache:
+            bq_id = self.para_pr_cache[cache_key]
+        else:
+            bq_id = self._create_para_pr_with_margin(bq_margin)
+            self.para_pr_cache[cache_key] = bq_id
+
+        result = []
+        for block in (content or []):
+            if not isinstance(block, dict):
+                continue
+            bt = block.get('t')
+            bc = block.get('c')
+            if bt in ('Para', 'Plain'):
+                result.append(
+                    self._create_para_start(style_id=self.normal_style_id, para_pr_id=bq_id)
+                    + self._process_inlines(bc) + '</hp:p>')
+            elif bt == 'Header':
+                result.append(self._handle_header(bc))
+            elif bt == 'BulletList':
+                result.append(self._handle_bullet_list(bc))
+            elif bt == 'OrderedList':
+                result.append(self._handle_ordered_list(bc))
+            elif bt == 'Table':
+                result.append(self._handle_table(bc, para_pr_id=bq_id))
+            elif bt == 'HorizontalRule':
+                result.append(self._handle_horizontal_rule())
+            elif bt == 'BlockQuote':
+                result.append(self._handle_block_quote(bc, para_pr_id=bq_id))
+            elif bt == 'CodeBlock':
+                result.append(self._handle_code_block(bc))
+        return "\n".join(result)
+
+    # ------------------------------------------------------------------ top-level
+
+    def _process_blocks(self, blocks):
+        result = []
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+            bt = block.get('t')
+            bc = block.get('c')
+
+            if bt == 'Para':
+                result.append(self._handle_para(bc))
+            elif bt == 'Plain':
+                result.append(self._handle_plain(bc))
+            elif bt == 'Header':
+                result.append(self._handle_header(bc))
+            elif bt == 'BulletList':
+                result.append(self._handle_bullet_list(bc))
+            elif bt == 'OrderedList':
+                result.append(self._handle_ordered_list(bc))
+            elif bt == 'Table':
+                xml = self._handle_table(bc)
+                if xml:
+                    result.append(xml)
+            elif bt == 'Div':
+                inner = bc[1] if (bc and len(bc) > 1) else []
+                result.append(self._process_blocks(inner))
+            elif bt == 'CodeBlock':
+                result.append(self._handle_code_block(bc))
+            elif bt == 'HorizontalRule':
+                result.append(self._handle_horizontal_rule())
+            elif bt == 'BlockQuote':
+                result.append(self._handle_block_quote(bc))
+            elif bt == 'RawBlock':
+                xml = self._handle_raw_block_in_list(bc)
+                if xml:
+                    result.append(xml)
 
         return "\n".join(result)
 
     def _process_inlines(self, inlines, active_formats=None, base_color=None, base_size=None):
-        """Process inline elements with style preservation - ENHANCED to handle all formatting"""
         if active_formats is None:
             active_formats = set()
-        
         result = []
-        
         for inline in inlines:
-            inline_type = inline.get('t')
-            content = inline.get('c')
-            
-            if inline_type == 'Str':
-                char_pr_id = self._get_or_create_char_pr(
-                    base_char_pr_id=0,
-                    active_formats=active_formats,
-                    color=base_color,
-                    font_size=base_size
-                )
-                text = saxutils.escape(content)
-                result.append(f'<hp:run charPrIDRef="{char_pr_id}"><hp:t>{text}</hp:t></hp:run>')
-                
-            elif inline_type == 'Space':
-                char_pr_id = self._get_or_create_char_pr(
-                    base_char_pr_id=0,
-                    active_formats=active_formats,
-                    color=base_color,
-                    font_size=base_size
-                )
-                result.append(f'<hp:run charPrIDRef="{char_pr_id}"><hp:t> </hp:t></hp:run>')
-                
-            elif inline_type == 'Strong':
-                new_formats = active_formats.copy()
-                new_formats.add('BOLD')
-                result.append(self._process_inlines(content, new_formats, base_color, base_size))
-                
-            elif inline_type == 'Emph':
-                new_formats = active_formats.copy()
-                new_formats.add('ITALIC')
-                result.append(self._process_inlines(content, new_formats, base_color, base_size))
-                
-            elif inline_type == 'Underline':
-                new_formats = active_formats.copy()
-                new_formats.add('UNDERLINE')
-                result.append(self._process_inlines(content, new_formats, base_color, base_size))
-                
-            elif inline_type == 'Strikeout':
-                new_formats = active_formats.copy()
-                new_formats.add('STRIKEOUT')
-                result.append(self._process_inlines(content, new_formats, base_color, base_size))
-                
-            elif inline_type == 'Superscript':
-                new_formats = active_formats.copy()
-                new_formats.add('SUPERSCRIPT')
-                result.append(self._process_inlines(content, new_formats, base_color, base_size))
-                
-            elif inline_type == 'Subscript':
-                new_formats = active_formats.copy()
-                new_formats.add('SUBSCRIPT')
-                result.append(self._process_inlines(content, new_formats, base_color, base_size))
-                
-            elif inline_type == 'Span':
-                # Extract styles from span attributes
-                attr = content[0]
-                span_inlines = content[1]
+            it = inline.get('t')
+            ic = inline.get('c')
+
+            if it == 'Str':
+                cid = self._get_or_create_char_pr(0, active_formats, base_color, base_size)
+                result.append(
+                    f'<hp:run charPrIDRef="{cid}"><hp:t>{saxutils.escape(ic)}</hp:t></hp:run>')
+            elif it == 'Space':
+                cid = self._get_or_create_char_pr(0, active_formats, base_color, base_size)
+                result.append(f'<hp:run charPrIDRef="{cid}"><hp:t> </hp:t></hp:run>')
+            elif it == 'Strong':
+                nf = active_formats | {'BOLD'}
+                result.append(self._process_inlines(ic, nf, base_color, base_size))
+            elif it == 'Emph':
+                nf = active_formats | {'ITALIC'}
+                result.append(self._process_inlines(ic, nf, base_color, base_size))
+            elif it == 'Underline':
+                nf = active_formats | {'UNDERLINE'}
+                result.append(self._process_inlines(ic, nf, base_color, base_size))
+            elif it == 'Strikeout':
+                nf = active_formats | {'STRIKEOUT'}
+                result.append(self._process_inlines(ic, nf, base_color, base_size))
+            elif it == 'Superscript':
+                nf = active_formats | {'SUPERSCRIPT'}
+                result.append(self._process_inlines(ic, nf, base_color, base_size))
+            elif it == 'Subscript':
+                nf = active_formats | {'SUBSCRIPT'}
+                result.append(self._process_inlines(ic, nf, base_color, base_size))
+            elif it == 'Span':
+                attr = ic[0]
+                span_inlines = ic[1]
                 styles = self._extract_style_from_attr(attr)
-                
-                new_formats = active_formats.copy()
-                new_color = base_color
-                new_size = base_size
-                
+                nf = active_formats.copy()
+                nc, ns = base_color, base_size
                 if styles.get('bold'):
-                    new_formats.add('BOLD')
+                    nf.add('BOLD')
                 if styles.get('italic'):
-                    new_formats.add('ITALIC')
+                    nf.add('ITALIC')
                 if styles.get('underline'):
-                    new_formats.add('UNDERLINE')
+                    nf.add('UNDERLINE')
                 if styles.get('strikeout'):
-                    new_formats.add('STRIKEOUT')
+                    nf.add('STRIKEOUT')
                 if 'color' in styles:
-                    new_color = styles['color']
+                    nc = styles['color']
                 if 'font-size' in styles:
-                    new_size = styles['font-size']
-                    
-                result.append(self._process_inlines(span_inlines, new_formats, new_color, new_size))
-                
-            elif inline_type == 'LineBreak':
-                # LineBreak is handled at paragraph level in table cells
-                # For normal paragraphs, add line segment
+                    ns = styles['font-size']
+                result.append(self._process_inlines(span_inlines, nf, nc, ns))
+            elif it == 'LineBreak':
                 result.append('<hp:lineseg/>')
-                
-            elif inline_type == 'SoftBreak':
-                # Soft breaks become spaces in HWPX
-                char_pr_id = self._get_or_create_char_pr(
-                    base_char_pr_id=0,
-                    active_formats=active_formats,
-                    color=base_color,
-                    font_size=base_size
-                )
-                result.append(f'<hp:run charPrIDRef="{char_pr_id}"><hp:t> </hp:t></hp:run>')
-                
-            elif inline_type == 'Code':
-                # Inline code - use monospace styling if available
-                char_pr_id = self._get_or_create_char_pr(
-                    base_char_pr_id=0,
-                    active_formats=active_formats,
-                    color=base_color,
-                    font_size=base_size
-                )
-                text = saxutils.escape(content[1])  # content = [attr, text]
-                result.append(f'<hp:run charPrIDRef="{char_pr_id}"><hp:t>{text}</hp:t></hp:run>')
-                
+            elif it == 'SoftBreak':
+                cid = self._get_or_create_char_pr(0, active_formats, base_color, base_size)
+                result.append(f'<hp:run charPrIDRef="{cid}"><hp:t> </hp:t></hp:run>')
+            elif it == 'Code':
+                cid = self._get_or_create_char_pr(0, active_formats, base_color, base_size)
+                result.append(
+                    f'<hp:run charPrIDRef="{cid}"><hp:t>{saxutils.escape(ic[1])}</hp:t></hp:run>')
+
         return "".join(result)
 
+    # ------------------------------------------------------------------ entry points
+
     def process(self):
-        """Main processing method"""
         if not self.ast:
             return ""
-        
         blocks = self.ast.get('blocks', [])
         self.output = [self._process_blocks(blocks)]
         return "\n".join(self.output)
 
     def get_modified_header_xml(self):
-        """Return the modified header.xml content"""
         if self.header_tree is None:
             return self.header_xml_content
-        
-        # Update itemCnt for charProperties
-        char_props = self.header_root.find('.//hh:charProperties', self.namespaces)
-        if char_props is not None:
-            char_count = len(char_props.findall('hh:charPr', self.namespaces))
-            char_props.set('itemCnt', str(char_count))
-        
-        # Update itemCnt for paraProperties
-        para_props = self.header_root.find('.//hh:paraProperties', self.namespaces)
-        if para_props is not None:
-            para_count = len(para_props.findall('hh:paraPr', self.namespaces))
-            para_props.set('itemCnt', str(para_count))
-        
-        # Update itemCnt for borderFills
-        border_fills = self.header_root.find('.//hh:borderFills', self.namespaces)
-        if border_fills is not None:
-            border_fill_count = len(border_fills.findall('hh:borderFill', self.namespaces))
-            border_fills.set('itemCnt', str(border_fill_count))
-        
+
+        for section, tag in [
+            ('.//hh:charProperties', 'hh:charPr'),
+            ('.//hh:paraProperties', 'hh:paraPr'),
+            ('.//hh:borderFills', 'hh:borderFill'),
+        ]:
+            container = self.header_root.find(section, self.namespaces)
+            if container is not None:
+                count = len(container.findall(tag, self.namespaces))
+                container.set('itemCnt', str(count))
+
         return ET.tostring(self.header_root, encoding='unicode', method='xml')
 
     @staticmethod
     def convert_to_hwpx(input_path, output_path, reference_path):
-        """Convert input file to HWPX format using reference template"""
-        # Read reference HWPX (supports both a .hwpx zip file and an extracted folder)
+        """Convert input file to HWPX using a reference template."""
         if os.path.isdir(reference_path):
-            with open(os.path.join(reference_path, 'Contents', 'header.xml'), 'r', encoding='utf-8') as f:
+            with open(os.path.join(reference_path, 'Contents', 'header.xml'),
+                      'r', encoding='utf-8') as f:
                 header_xml = f.read()
-            with open(os.path.join(reference_path, 'Contents', 'section0.xml'), 'r', encoding='utf-8') as f:
+            with open(os.path.join(reference_path, 'Contents', 'section0.xml'),
+                      'r', encoding='utf-8') as f:
                 section0_xml = f.read()
         else:
             with zipfile.ZipFile(reference_path, 'r') as ref_zip:
                 header_xml = ref_zip.read('Contents/header.xml').decode('utf-8')
                 section0_xml = ref_zip.read('Contents/section0.xml').decode('utf-8')
-        
-        # Read input file content if it's HTML
+
         html_content = None
         if input_path.lower().endswith('.html'):
             with open(input_path, 'r', encoding='utf-8') as f:
                 html_content = f.read()
-        
-        # Convert to JSON AST using pypandoc
+
         json_str = pypandoc.convert_file(input_path, 'json', format=None)
         ast = json.loads(json_str)
-        
-        # Process with style preservation
-        converter = PandocToHwpx(json_ast=ast, header_xml_content=header_xml, html_content=html_content)
+
+        converter = PandocToHwpx(
+            json_ast=ast, header_xml_content=header_xml, html_content=html_content)
         section_content = converter.process()
         modified_header = converter.get_modified_header_xml()
-        
-        # Create section XML
+
         section_xml = f'''<?xml version="1.0" encoding="utf-8"?>
 <hs:sec xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph" xmlns:hs="http://www.hancom.co.kr/hwpml/2011/section">
   <hp:p paraPrIDRef="1" styleIDRef="0" pageBreak="0" columnBreak="0" merged="0">
@@ -2002,11 +1443,9 @@ class PandocToHwpx:
   </hp:p>
 {section_content}
 </hs:sec>'''
-        
-        # Create output HWPX
+
+        skip = {'Contents/header.xml', 'Contents/section0.xml'}
         with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as out_zip:
-            # Copy all files from reference except header.xml and section0.xml
-            skip = {'Contents/header.xml', 'Contents/section0.xml'}
             if os.path.isdir(reference_path):
                 for root, _, files in os.walk(reference_path):
                     for fname in files:
@@ -2021,6 +1460,5 @@ class PandocToHwpx:
                         if item not in skip:
                             out_zip.writestr(item, ref_zip.read(item))
 
-            # Write modified files
             out_zip.writestr('Contents/header.xml', modified_header.encode('utf-8'))
             out_zip.writestr('Contents/section0.xml', section_xml.encode('utf-8'))
